@@ -1,7 +1,7 @@
 # plugins/message.py
 from PyQt6.QtWidgets import QDialog, QTextEdit, QLineEdit, QFormLayout, QPushButton, QHBoxLayout
 from .base_plugin import BasePlugin
-import json
+import ujson as json
 
 class MessageDialog(QDialog):
     def __init__(self, parent=None, target="all", client=None, topic="/commands/"):

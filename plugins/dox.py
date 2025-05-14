@@ -1,7 +1,7 @@
 # plugins/dox.py
 from PyQt6.QtWidgets import QMessageBox
 from .base_plugin import BasePlugin
-import json
+import ujson as json
 import binascii
 import zipfile
 

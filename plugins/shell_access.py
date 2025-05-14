@@ -2,7 +2,7 @@
 from PyQt6.QtWidgets import QDialog, QTextEdit, QLineEdit, QFormLayout, QPushButton, QHBoxLayout
 from PyQt6.QtCore import QTimer
 from .base_plugin import BasePlugin
-import json
+import ujson as json
 
 class ShellAccessDialog(QDialog):
     def __init__(self, parent=None, target="all", current_dir="", client=None, topic="/commands/"):

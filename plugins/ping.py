@@ -1,6 +1,6 @@
 # plugins/ping.py
 from .base_plugin import BasePlugin
-import json
+import ujson as json
 
 class PingPlugin(BasePlugin):
     def __init__(self, parent):
