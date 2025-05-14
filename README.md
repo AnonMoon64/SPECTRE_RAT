@@ -10,6 +10,7 @@ Chean Script: Add a cleaning script that pings all connections in connections.js
 GUI Enhancements
 Improve the interface with sortable bot lists, search filters, and a modern design.
 Add bot grouping (e.g., by OS or IP) for easier management of multiple bots.
+Add creation of server file in another thread.
 
 Security Enhancements
 Encryption: Use AES to encrypt MQTT messages between the bot and GUI, protecting sensitive data.
