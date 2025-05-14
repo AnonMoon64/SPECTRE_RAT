@@ -8,7 +8,7 @@ class DisconnectPlugin(BasePlugin):
         super().__init__(parent)
         self.name = "Disconnect"
         self.menu_action = self.name
-        self.priority = 0  # Lowest priority, bottom of the menu
+        self.priority = 1  # Lowest priority, bottom of the menu
 
     def execute(self, target):
         # Confirmation for disconnecting all bots

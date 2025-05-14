@@ -4,6 +4,7 @@ from PyQt6.QtWidgets import QMessageBox
 from PyQt6.QtCore import QTimer
 import ujson as json
 import os
+import time
 
 class CleanerPlugin(BasePlugin):
     def __init__(self, parent):
@@ -13,7 +14,9 @@ class CleanerPlugin(BasePlugin):
         self.priority = 80
         self.first_run = True  # Track if this is the first run
         self.pending_bots = {}  # Track bots waiting for a response
-        self.timeout_ms = 5000  # 5 seconds timeout
+        self.timeout_ms = 10000  # 10 seconds timeout
+        self.start_time = None  # Track when the ping commands are sent
+        self.responses_processed = False  # Track if we're still processing responses
 
     def execute(self, target):
         # On first run, show confirmation dialog
@@ -41,14 +44,19 @@ class CleanerPlugin(BasePlugin):
 
         # Ping each bot and set up a timeout
         self.pending_bots = {}
+        self.responses_processed = False
+        self.start_time = time.time()  # Record the start time
+        self.parent.log_area.append(f"Starting ping process at {self.start_time}")
         for bot in bots:
             bot_id = bot['id']
             ip = bot.get('ip', 'Unknown')
             target = f"{ip}:{bot_id}"
-            self.pending_bots[target] = True  # Mark as pending response
+            self.pending_bots[target] = False  # Initially mark as unresponsive
             self.parent.log_area.append(f"Pinging {target}...")
             cmd = {'type': 'command', 'target': target, 'action': 'ping'}
-            self.parent.client.publish(self.parent.topic, json.dumps(cmd))
+            cmd_json = json.dumps(cmd)
+            encrypted_cmd = self.parent.encrypt_message(cmd_json)
+            self.parent.client.publish(self.parent.topic, encrypted_cmd)
 
         # Set up a timer to check for timeouts
         QTimer.singleShot(self.timeout_ms, self.check_timeouts)
@@ -58,12 +66,26 @@ class CleanerPlugin(BasePlugin):
             ip = data['ip']
             bot_id = data['id']
             target = f"{ip}:{bot_id}"
+            # Only process the response if we're actively pinging (start_time is set)
+            if self.start_time is None:
+                self.parent.log_area.append(f"Ignoring connect message from {target} - no active ping operation")
+                return
+            current_time = time.time()
+            elapsed_time = current_time - self.start_time
+            self.parent.log_area.append(f"Received connect message from {target} after {elapsed_time:.2f} seconds")
             if target in self.pending_bots:
-                self.parent.log_area.append(f"Bot {target} responded to ping")
-                self.pending_bots[target] = False  # Mark as responded
+                self.parent.log_area.append(f"Bot {target} responded to ping after {elapsed_time:.2f} seconds")
+                self.pending_bots[target] = True  # Mark as responded
+            else:
+                self.parent.log_area.append(f"Received response from {target}, but it was not in pending_bots")
 
     def check_timeouts(self):
         """Check for bots that didn't respond within the timeout period and remove them."""
+        current_time = time.time()
+        elapsed_time = current_time - self.start_time
+        self.responses_processed = True  # Mark that we're done processing responses
+        self.parent.log_area.append(f"Checking timeouts after {elapsed_time:.2f} seconds")
+        self.parent.log_area.append(f"Pending bots before check: {self.pending_bots}")
         json_file = os.path.join(self.parent.data_dir, 'connections.json')
         if not os.path.exists(json_file):
             self.parent.log_area.append("Connections JSON file not found")
@@ -78,7 +100,8 @@ class CleanerPlugin(BasePlugin):
             bot_id = bot['id']
             ip = bot.get('ip', 'Unknown')
             target = f"{ip}:{bot_id}"
-            if target in self.pending_bots and self.pending_bots[target]:
+            self.parent.log_area.append(f"Checking bot {target}: responded={self.pending_bots.get(target, False)}")
+            if target in self.pending_bots and not self.pending_bots[target]:
                 self.parent.log_area.append(f"Bot {target} did not respond, removing...")
                 # Remove from device table
                 self.parent.remove_device_from_table(ip, bot_id)

