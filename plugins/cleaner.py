@@ -9,9 +9,10 @@ import time
 class CleanerPlugin(BasePlugin):
     def __init__(self, parent):
         super().__init__(parent)
-        self.name = "Clean Connections"
+        self.name = "Clean"
         self.menu_action = self.name
-        self.priority = 80
+        self.category = "Bot"
+        self.priority = 3
         self.first_run = True  # Track if this is the first run
         self.pending_bots = {}  # Track bots waiting for a response
         self.timeout_ms = 10000  # 10 seconds timeout

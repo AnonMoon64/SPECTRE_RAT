@@ -4,9 +4,10 @@ from .base_plugin import BasePlugin
 class RefreshPlugin(BasePlugin):
     def __init__(self, parent):
         super().__init__(parent)
-        self.name = "Refresh Bots"
+        self.name = "Refresh"
         self.menu_action = self.name
-        self.priority = 90  # High priority, near the top of the menu
+        self.category = "Bot"
+        self.priority = 2
 
     def execute(self, target):
         try:

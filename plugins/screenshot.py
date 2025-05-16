@@ -9,6 +9,7 @@ class ScreenshotPlugin(BasePlugin):
         super().__init__(parent)
         self.name = "Take Screenshot"
         self.menu_action = self.name
+        self.category = "Interaction"
         self.priority = 50
 
     def execute(self, target):

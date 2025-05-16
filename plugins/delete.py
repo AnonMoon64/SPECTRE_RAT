@@ -10,7 +10,8 @@ class DeletePlugin(BasePlugin):
         self.name = "Remove Bot"
         # Only removes it from connections doesn't delete the bot from victim's computer.
         self.menu_action = self.name
-        self.priority = 10  # Low priority, near the bottom of the menu
+        self.category = "Bot"
+        self.priority = 90  # Low priority, near the bottom of the menu
 
     def execute(self, target):
         if target == 'all':

@@ -78,6 +78,7 @@ class MessagePlugin(BasePlugin):
         self.name = "Send Message"
         self.menu_action = self.name
         self.priority = 60
+        self.category = "Interaction"
         self.dialogs = {}
         self.message_buffers = {}  # Buffer messages for each target
         # Clear any old buffered messages at startup

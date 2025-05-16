@@ -253,6 +253,7 @@ class ShellAccessPlugin(BasePlugin):
         logger.info("Initializing ShellAccessPlugin")
         self.name = "Shell Access"
         self.menu_action = self.name
+        self.category = "Interaction"
         self.priority = 40
         self.dialogs = {}
         self.current_dirs = {}
