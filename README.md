@@ -82,6 +82,9 @@ Contributions are welcome!  Please submit a pull request or open issues for bugs
 #### License
 This project is licensed under the MIT License.
 
+#### Safety:
+This tool is for educational purposes only.  Do not use it for malicious activities.
+
 #### Acknowledgments
 - Built with **PyQt6** for the GUI.
 - Uses **paho-mqtt** for MQTT communication.
